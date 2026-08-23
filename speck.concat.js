@@ -1,0 +1,1731 @@
+/* SPECK — genome.js: the shared heart. Hex body plan, organelle definitions,
+ * stat derivation, NPC mutation, and the one true cell renderer.
+ * FROZEN CONTRACT: every module receives this exact source. */
+window.SPECK = window.SPECK || { modules: {} };
+window.SPECK.genome = (function () {
+  'use strict';
+  // 19 hex slots, pointy-top axial coords: slot 0 = nucleus (fixed), 1-6 inner
+  // ring, 7-18 outer ring.
+  var AX = [[0,0],[1,0],[0,1],[-1,1],[-1,0],[0,-1],[1,-1],
+            [2,0],[1,1],[0,2],[-1,2],[-2,2],[-2,1],[-2,0],[-1,-1],[0,-2],[1,-2],[2,-2],[2,-1]];
+  var SQ3 = Math.sqrt(3);
+  var POS = AX.map(function (a) { return { x: SQ3 * (a[0] + a[1] / 2), y: 1.5 * a[1] }; });
+  var OUT = POS.map(function (p, i) { return i === 0 ? 0 : Math.atan2(p.y, p.x); });
+  var MAXP = 2 * SQ3; // radial extent of the outer ring
+
+  var ORGANELLES = {
+    fla: { name: 'Flagellum',    era: 1, dna: 0,  mass: 2, color: '#8fd8ff',
+           desc: 'A whipping tail. More flagella, more thrust.',           stats: { thrust: 26 } },
+    vac: { name: 'Vacuole',      era: 1, dna: 4,  mass: 2, color: '#59c2ff',
+           desc: 'Storage bubble. Grow bigger before dividing.',           stats: { cap: 30 } },
+    cil: { name: 'Cilia',        era: 1, dna: 6,  mass: 1, color: '#a8f0e8',
+           desc: 'Fine hairs. Sharper turns, a little push.',              stats: { turn: 2.2, thrust: 6 } },
+    sen: { name: 'Sensor',       era: 2, dna: 8,  mass: 1, color: '#e8e4d8',
+           desc: 'A primitive eye. See farther.',                          stats: { vision: 0.16 } },
+    chl: { name: 'Chloroplast',  era: 2, dna: 10, mass: 3, color: '#7ce27a',
+           desc: 'Drink the light. Passive energy and a DNA trickle.',     stats: { photo: 2.1 } },
+    mit: { name: 'Mitochondria', era: 2, dna: 12, mass: 2, color: '#ffb45c',
+           desc: 'Burn biomass into energy when starving.',                stats: { mito: 1.6 } },
+    mem: { name: 'Membrane',     era: 3, dna: 12, mass: 3, color: '#7aa2f7',
+           desc: 'Armor plating. Tough but heavy.',                        stats: { armor: 5, drag: 0.05 } },
+    spk: { name: 'Spike',        era: 3, dna: 14, mass: 2, color: '#ff6f5c',
+           desc: 'Contact weapon. Hurts everything you touch.',            stats: { dmg: 8, armor: 1 } },
+    tox: { name: 'Toxin Gland',  era: 3, dna: 18, mass: 3, color: '#c95bff',
+           desc: 'Ranged weapon. Fire bolts at your cursor.',              stats: { shot: 1 } },
+    adh: { name: 'Adhesin',      era: 4, dna: 25, mass: 2, color: '#ffd166',
+           desc: 'Colony bond. Keep four daughters attached to win.',      stats: { adhesin: 1 } }
+  };
+
+  var BASE = { thrust: 18, turn: 2.4, cap: 60, vision: 1, armor: 0, dmg: 0,
+               photo: 0, mito: 0.6, shot: 0, adhesin: 0, drag: 0, mass: 10 };
+
+  function computeStats(g) {
+    var s = {}; for (var k in BASE) s[k] = BASE[k];
+    for (var i = 1; i < 19; i++) {
+      var o = g[i] && ORGANELLES[g[i]];
+      if (!o) continue;
+      s.mass += o.mass;
+      for (var st in o.stats) s[st] += o.stats[st];
+    }
+    return s;
+  }
+  function genomeCost(g) {          // biomass price of the body plan
+    var m = 0;
+    for (var i = 1; i < 19; i++) if (g[i] && ORGANELLES[g[i]]) m += ORGANELLES[g[i]].mass;
+    return m;
+  }
+  function radiusOf(biomass) { return 10 + Math.sqrt(Math.max(0, biomass)) * 2.2; }
+
+  function emptyGenome() { var g = new Array(19); for (var i = 0; i < 19; i++) g[i] = null; return g; }
+
+  // NPC evolution: add, remove, or swap one organelle drawn from `pool`.
+  function mutate(g, rng, pool) {
+    var ng = g.slice();
+    var ids = pool || Object.keys(ORGANELLES);
+    var roll = rng();
+    var empt = [], full = [];
+    for (var i = 1; i < 19; i++) (ng[i] ? full : empt).push(i);
+    if ((roll < 0.5 && empt.length) || !full.length) {
+      ng[empt[(rng() * empt.length) | 0]] = ids[(rng() * ids.length) | 0];
+    } else if (roll < 0.75 && full.length > 1) {
+      ng[full[(rng() * full.length) | 0]] = null;
+    } else if (full.length) {
+      ng[full[(rng() * full.length) | 0]] = ids[(rng() * ids.length) | 0];
+    }
+    return ng;
+  }
+
+  // The one true cell renderer. Draws membrane, interior, nucleus, and every
+  // organelle at its hex slot. angle rotates the whole body.
+  // opts: {alpha, flash (0..1 damage flash), ghost (editor preview)}
+  function drawCell(ctx, x, y, angle, r, g, hue, t, opts) {
+    opts = opts || {};
+    var st = computeStats(g);
+    var scale = (0.72 * r) / MAXP;
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.rotate(angle);
+    ctx.globalAlpha = opts.alpha == null ? 1 : opts.alpha;
+
+    // membrane: wobbly blob
+    var N = 26;
+    ctx.beginPath();
+    for (var i = 0; i <= N; i++) {
+      var a = (i / N) * Math.PI * 2;
+      var wob = Math.sin(a * 3 + t * 2.1) * 0.035 + Math.sin(a * 5 - t * 1.3) * 0.02;
+      var rr = r * (1 + wob);
+      if (i === 0) ctx.moveTo(Math.cos(a) * rr, Math.sin(a) * rr);
+      else ctx.lineTo(Math.cos(a) * rr, Math.sin(a) * rr);
+    }
+    ctx.closePath();
+    var grad = ctx.createRadialGradient(0, 0, r * 0.1, 0, 0, r);
+    grad.addColorStop(0, 'hsla(' + hue + ',55%,30%,0.95)');
+    grad.addColorStop(0.75, 'hsla(' + hue + ',60%,17%,0.92)');
+    grad.addColorStop(1, 'hsla(' + hue + ',65%,12%,0.9)');
+    ctx.fillStyle = grad;
+    ctx.fill();
+    ctx.lineWidth = Math.max(1.2, r * 0.05) + st.armor * 0.35;
+    ctx.strokeStyle = opts.flash ? 'rgba(255,120,120,' + (0.4 + 0.6 * opts.flash) + ')'
+                                 : 'hsla(' + hue + ',70%,60%,0.85)';
+    ctx.stroke();
+
+    // organelles
+    for (var s = 1; s < 19; s++) {
+      var id = g[s];
+      if (!id || !ORGANELLES[id]) continue;
+      var p = POS[s], px = p.x * scale, py = p.y * scale;
+      var oa = OUT[s], col = ORGANELLES[id].color;
+      var u = Math.max(2.2, r * 0.11);
+      ctx.save();
+      ctx.translate(px, py);
+      if (id === 'fla') {
+        ctx.rotate(oa);
+        ctx.strokeStyle = col; ctx.lineWidth = Math.max(1, u * 0.35);
+        ctx.beginPath(); ctx.moveTo(0, 0);
+        var L = r * 0.85;
+        for (var q = 1; q <= 8; q++) {
+          var f = q / 8;
+          ctx.lineTo((r - px * 0 + L * f) * 0.55 + u, Math.sin(f * 5 + t * 7 + s) * u * (0.5 + f));
+        }
+        ctx.stroke();
+        ctx.fillStyle = col;
+        ctx.beginPath(); ctx.arc(0, 0, u * 0.55, 0, 7); ctx.fill();
+      } else if (id === 'spk') {
+        ctx.rotate(oa);
+        ctx.fillStyle = col;
+        ctx.beginPath();
+        ctx.moveTo(r * 0.36, 0); ctx.lineTo(0, u * 0.7); ctx.lineTo(0, -u * 0.7);
+        ctx.closePath(); ctx.fill();
+      } else if (id === 'chl') {
+        ctx.fillStyle = col;
+        for (var c2 = 0; c2 < 3; c2++) {
+          ctx.beginPath();
+          ctx.ellipse((c2 - 1) * u * 0.5, 0, u * 0.42, u * 0.72, 0.5, 0, 7);
+          ctx.fill();
+        }
+      } else if (id === 'mit') {
+        ctx.rotate(0.6);
+        ctx.fillStyle = col;
+        ctx.beginPath(); ctx.ellipse(0, 0, u * 1.05, u * 0.6, 0, 0, 7); ctx.fill();
+        ctx.strokeStyle = 'rgba(40,20,5,0.6)'; ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(-u * 0.6, -u * 0.25); ctx.lineTo(-u * 0.2, u * 0.25);
+        ctx.moveTo(0, -u * 0.3); ctx.lineTo(u * 0.35, u * 0.25);
+        ctx.stroke();
+      } else if (id === 'vac') {
+        ctx.fillStyle = 'rgba(120,200,255,0.28)';
+        ctx.strokeStyle = col; ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.arc(0, 0, u * 1.05, 0, 7); ctx.fill(); ctx.stroke();
+      } else if (id === 'sen') {
+        ctx.fillStyle = '#0a0c12';
+        ctx.beginPath(); ctx.arc(0, 0, u * 0.8, 0, 7); ctx.fill();
+        ctx.fillStyle = col;
+        ctx.beginPath(); ctx.arc(Math.cos(oa) * u * 0.3, Math.sin(oa) * u * 0.3, u * 0.42, 0, 7); ctx.fill();
+      } else if (id === 'tox') {
+        ctx.fillStyle = col;
+        ctx.beginPath(); ctx.arc(0, 0, u * 0.9, 0, 7); ctx.fill();
+        ctx.fillStyle = 'rgba(255,255,255,0.75)';
+        ctx.beginPath(); ctx.arc(0, 0, u * 0.35 * (1 + 0.3 * Math.sin(t * 5 + s)), 0, 7); ctx.fill();
+      } else if (id === 'mem') {
+        ctx.rotate(oa);
+        ctx.strokeStyle = col; ctx.lineWidth = u * 0.5;
+        ctx.beginPath(); ctx.arc(-px * 0, 0, r * 0.9 - Math.hypot(px, py), -0.7, 0.7); ctx.stroke();
+      } else if (id === 'adh') {
+        ctx.strokeStyle = col; ctx.lineWidth = Math.max(1, u * 0.3);
+        ctx.beginPath(); ctx.arc(0, 0, u * 0.9, 0, 7); ctx.stroke();
+        ctx.fillStyle = col;
+        for (var h2 = 0; h2 < 4; h2++) {
+          var ha = h2 * Math.PI / 2 + t;
+          ctx.beginPath(); ctx.arc(Math.cos(ha) * u * 0.9, Math.sin(ha) * u * 0.9, u * 0.22, 0, 7); ctx.fill();
+        }
+      } else if (id === 'cil') {
+        ctx.rotate(oa);
+        ctx.strokeStyle = col; ctx.lineWidth = 1;
+        for (var q2 = -2; q2 <= 2; q2++) {
+          ctx.beginPath();
+          ctx.moveTo(u * 0.3, q2 * u * 0.35);
+          ctx.lineTo(u * (1 + 0.25 * Math.sin(t * 9 + q2)), q2 * u * 0.4);
+          ctx.stroke();
+        }
+      }
+      ctx.restore();
+    }
+
+    // nucleus
+    ctx.fillStyle = 'hsla(' + hue + ',35%,8%,0.95)';
+    ctx.beginPath(); ctx.arc(0, 0, Math.max(3, r * 0.2), 0, 7); ctx.fill();
+    ctx.strokeStyle = 'hsla(' + hue + ',60%,45%,0.6)';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  return { SLOTS: 19, POS: POS, OUT: OUT, MAXP: MAXP, ORGANELLES: ORGANELLES,
+           computeStats: computeStats, genomeCost: genomeCost, radiusOf: radiusOf,
+           emptyGenome: emptyGenome, mutate: mutate, drawCell: drawCell };
+})();
+
+
+/* ==== module: sim (fixed) ==== */
+/* SPECK — sim.js: world init+update. Motes, upwellings, light cycle, all cell
+ * physics/AI/eating/energy/division/mutation/death, colony win, immigration.
+ * LOOP CAPS: cells <= 64 (incl player); motes: spawn cap 240, hard cap 280
+ * (corpse-scatter overflow), <= 18 corpse motes per death; 3 upwellings;
+ * cell-pair loop <= 64*63/2 ~ 2k; mote scans <= 64*280 ~ 18k dist checks/frame.
+ * Physics/economy numbers follow the shared truth exactly. */
+window.SPECK = window.SPECK || { modules: {} };
+window.SPECK.modules.sim = (function () {
+  'use strict';
+
+  var GEN = window.SPECK.genome;
+  var TAU = Math.PI * 2;
+  var HUES = [190, 95, 55, 0, 285]; // player, Grazer, Sunspinner, Lancer, Spitter
+  var MOTE_CAP = 240, MOTE_HARD = 280, CELL_CAP = 64, CORPSE_MOTES = 18;
+
+  var nextId = 1, won = false, spawnAcc = 0;
+
+  // ---------------------------------------------------------------- helpers
+
+  function addDna(G, v) { G.dna += v; if (G.stats) G.stats.dnaEarned += v; }
+
+  function maxhpOf(G, c, st) {
+    var m = 20 + st.armor * 6;
+    if (c === G.player && G.perks && G.perks.visc) m *= 1.25;
+    return m;
+  }
+
+  // Species base genomes in sensible slots (13/12/14 = rear outer ring,
+  // 7/18 = front outer ring, 1/2/5 = inner ring).
+  function template(sp) {
+    var g = GEN.emptyGenome();
+    if (sp === 1) { g[13] = 'fla'; g[14] = 'fla'; g[12] = 'cil'; }                    // Grazer
+    else if (sp === 2) { g[2] = 'chl'; g[5] = 'chl'; g[1] = 'vac'; }                  // Sunspinner
+    else if (sp === 3) { g[13] = 'fla'; g[12] = 'fla'; g[7] = 'spk'; g[18] = 'spk'; } // Lancer
+    else { g[13] = 'fla'; g[1] = 'tox'; g[7] = 'sen'; }                               // Spitter
+    return g;
+  }
+
+  function makeCell(G, sp, genome, x, y, gen) {
+    var st = GEN.computeStats(genome);
+    var c = {
+      id: nextId++, species: sp, hue: HUES[sp],
+      x: x, y: y, vx: 0, vy: 0, angle: G.rng() * TAU,
+      biomass: 12 + GEN.genomeCost(genome) * 1.6 + G.rng() * 8,
+      hp: 20 + st.armor * 6, energy: 60 + G.rng() * 30,
+      genome: genome, gen: gen || 0, age: 0, dead: false,
+      cool: { fire: 0, bite: 0 }, flash: 0, peak: 0
+    };
+    c.peak = c.biomass;
+    return c;
+  }
+
+  function spawnMote(G) {
+    var W = G.world, x, y, a, d;
+    if (G.rng() < 0.78 && W.upwell.length) {  // cluster near an upwelling
+      var uw = W.upwell[(G.rng() * W.upwell.length) | 0];
+      a = G.rng() * TAU; d = Math.pow(G.rng(), 0.6) * 300;
+      x = uw.x + Math.cos(a) * d; y = uw.y + Math.sin(a) * d;
+    } else {                                  // faint background sprinkle
+      a = G.rng() * TAU; d = Math.sqrt(G.rng()) * W.R * 0.94;
+      x = Math.cos(a) * d; y = Math.sin(a) * d;
+    }
+    var dd = Math.hypot(x, y), lim = W.R * 0.96;
+    if (dd > lim) { x *= lim / dd; y *= lim / dd; }
+    W.motes.push({ x: x, y: y, vx: (G.rng() - 0.5) * 6, vy: (G.rng() - 0.5) * 6, e: 1 });
+  }
+
+  // Death: scatter ~biomass/3 motes (capped), fx, player hook. Removal is the
+  // sweep's job.
+  function die(G, c) {
+    if (c.dead) return;
+    c.dead = true;
+    var W = G.world, hooks = G.hooks || {};
+    var r = GEN.radiusOf(c.biomass);
+    var nm = Math.min(CORPSE_MOTES, Math.round(c.biomass / 3));
+    for (var k = 0; k < nm && W.motes.length < MOTE_HARD; k++) {
+      var a = G.rng() * TAU, d = G.rng() * r * 1.4;
+      W.motes.push({
+        x: c.x + Math.cos(a) * d, y: c.y + Math.sin(a) * d,
+        vx: Math.cos(a) * (10 + G.rng() * 25), vy: Math.sin(a) * (10 + G.rng() * 25), e: 1
+      });
+    }
+    if (hooks.fx) hooks.fx('die', c.x, c.y, { hue: c.hue, r: r });
+    if (hooks.sfx) hooks.sfx('die');
+    if (c === G.player) {
+      G.divideReady = false;
+      if (hooks.playerDeath) hooks.playerDeath();
+    }
+  }
+
+  // A engulfs B at 14 biomass/s; B dies below 3 biomass. Player eater earns
+  // DNA by the prey's PEAK size (radius at death is always tiny once drained).
+  function transfer(G, A, B, dt) {
+    var t = Math.min(14 * dt, B.biomass);
+    A.biomass += t; B.biomass -= t;
+    if (A.biomass > A.peak) A.peak = A.biomass;
+    if (B.biomass < 3 && !B.dead) {
+      if (A === G.player && B !== G.player) {
+        addDna(G, GEN.radiusOf(B.peak) < 26 ? 3 : 6);
+        G.stats.cellsEaten++;
+      }
+      die(G, B);
+    }
+  }
+
+  // NPC steering: accumulate desire as a vector, return heading + throttle.
+  // Sensor range ~ 260 + vision*400 gates every scan.
+  function npcAI(G, c, st, r) {
+    var W = G.world, cells = G.cells, motes = W.motes;
+    var sense = 260 + st.vision * 400, s2 = sense * sense;
+    var vx = 0, vy = 0, th = 0.4;
+    var i, dx, dy, d2;
+    var threat = null, tD = s2, prey = null, pD = s2, small = null, sD = s2;
+    for (i = 0; i < cells.length; i++) {
+      var o = cells[i];
+      if (o === c || o.dead) continue;
+      dx = o.x - c.x; dy = o.y - c.y; d2 = dx * dx + dy * dy;
+      if (d2 > s2) continue;
+      var or_ = o._r != null ? o._r : GEN.radiusOf(o.biomass);
+      if (or_ > r * 1.25 && d2 < tD) { threat = o; tD = d2; }
+      if (or_ < r * 0.8 && d2 < pD) { prey = o; pD = d2; }
+      if (or_ < r && d2 < sD) { small = o; sD = d2; }
+    }
+    var mote = null, mD = s2;
+    if (c.species !== 2) {
+      for (i = 0; i < motes.length; i++) {
+        dx = motes[i].x - c.x; dy = motes[i].y - c.y; d2 = dx * dx + dy * dy;
+        if (d2 < mD) { mote = motes[i]; mD = d2; }
+      }
+    }
+    var dd;
+    if (c.species === 1) {           // Grazer: graze, flee the big
+      if (threat) { dd = Math.sqrt(tD) || 1; vx -= (threat.x - c.x) / dd * 2; vy -= (threat.y - c.y) / dd * 2; th = 1; }
+      else if (mote) { dd = Math.sqrt(mD) || 1; vx += (mote.x - c.x) / dd; vy += (mote.y - c.y) / dd; th = 0.8; }
+      else th = 0.35;
+    } else if (c.species === 2) {    // Sunspinner: drift to center light
+      dd = Math.hypot(c.x, c.y) || 1;
+      vx -= c.x / dd * 0.5; vy -= c.y / dd * 0.5; th = 0.2;
+      if (threat) { dd = Math.sqrt(tD) || 1; vx -= (threat.x - c.x) / dd * 0.7; vy -= (threat.y - c.y) / dd * 0.7; th = 0.45; }
+    } else if (c.species === 3) {    // Lancer: hunt the small, else graze
+      if (prey) { dd = Math.sqrt(pD) || 1; vx += (prey.x - c.x) / dd * 2; vy += (prey.y - c.y) / dd * 2; th = 1; }
+      else if (mote) { dd = Math.sqrt(mD) || 1; vx += (mote.x - c.x) / dd; vy += (mote.y - c.y) / dd; th = 0.7; }
+      else th = 0.4;
+    } else {                         // Spitter: hold 240-360px and strafe
+      if (small) {
+        dd = Math.sqrt(sD) || 1;
+        var ux = (small.x - c.x) / dd, uy = (small.y - c.y) / dd;
+        if (dd < 240) { vx -= ux * 1.5; vy -= uy * 1.5; th = 0.9; }
+        else if (dd > 360) { vx += ux; vy += uy; th = 0.8; }
+        else { var side = (c.id % 2) ? 1 : -1; vx -= uy * side; vy += ux * side; th = 0.7; }
+      } else if (mote && c.energy < 50) {  // graze when hungry, don't starve
+        dd = Math.sqrt(mD) || 1; vx += (mote.x - c.x) / dd; vy += (mote.y - c.y) / dd; th = 0.6;
+      } else th = 0.3;
+    }
+    // mild wander noise (deterministic, no rng draw)
+    var wa = G.time * 0.9 + c.id * 2.399;
+    vx += Math.cos(wa) * 0.3; vy += Math.sin(wa) * 0.3;
+    // avoid the dish edge
+    dd = Math.hypot(c.x, c.y);
+    if (dd > W.R * 0.82) {
+      var w = (dd - W.R * 0.82) / (W.R * 0.18) * 2.5;
+      vx -= c.x / dd * w; vy -= c.y / dd * w;
+    }
+    return { a: (vx || vy) ? Math.atan2(vy, vx) : c.angle, t: th };
+  }
+
+  // ------------------------------------------------------------------ init
+
+  function init(G) {
+    nextId = 1; won = false; spawnAcc = 0;
+    var W = G.world = G.world || {};
+    W.R = W.R || 2600;
+    W.light = 0.5;
+    if (!W.motes) W.motes = [];
+    W.motes.length = 0;
+    W.upwell = [];   // 3 slow-moving nutrient upwellings
+    var i, a, d;
+    for (i = 0; i < 3; i++) {
+      a = (i / 3) * TAU + G.rng();
+      d = W.R * (0.25 + G.rng() * 0.42);
+      W.upwell.push({ x: Math.cos(a) * d, y: Math.sin(a) * d, va: G.rng() * TAU, sp: 5 + G.rng() * 5 });
+    }
+    for (i = 0; i < MOTE_CAP; i++) spawnMote(G);
+
+    if (!G.cells) G.cells = [];
+    // fresh dish: drop stale NPCs from any previous init, keep only the player
+    for (i = G.cells.length - 1; i >= 0; i--) if (G.cells[i] !== G.player) G.cells.splice(i, 1);
+    // main owns the player cell; make sure it's registered and id-safe
+    if (G.player) {
+      if (G.cells.indexOf(G.player) < 0) G.cells.push(G.player);
+      if (G.player.peak == null) G.player.peak = G.player.biomass;
+      nextId = Math.max(nextId, (G.player.id | 0) + 1);
+    }
+    // starting populations: seeded placement away from player spawn at center
+    var POP = [0, 10, 8, 5, 4];
+    for (var sp = 1; sp <= 4; sp++) {
+      for (var k = 0; k < POP[sp] && G.cells.length < CELL_CAP; k++) {
+        a = G.rng() * TAU; d = W.R * (0.3 + G.rng() * 0.58);
+        G.cells.push(makeCell(G, sp, template(sp), Math.cos(a) * d, Math.sin(a) * d, 0));
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------- update
+
+  function update(G, dt) {
+    if (!dt || G.paused) return;
+    var W = G.world, R = W.R, cells = G.cells, motes = W.motes;
+    var hooks = G.hooks || {}, P = G.player;
+    var inp = G.input || { aimX: 0, aimY: 0, thrust: 0 };
+    var i, j, m, c, a, d, dx, dy, mo, st, uw;
+
+    // light cycle: eased (smoothstep) sine
+    var lr = 0.5 + 0.5 * Math.sin(G.time * 0.05);
+    W.light = lr * lr * (3 - 2 * lr);
+
+    // upwellings wander slowly, steered back inside R*0.72
+    for (i = 0; i < W.upwell.length; i++) {
+      uw = W.upwell[i];
+      uw.va += (G.rng() - 0.5) * 0.7 * dt;
+      uw.x += Math.cos(uw.va) * uw.sp * dt;
+      uw.y += Math.sin(uw.va) * uw.sp * dt;
+      d = Math.hypot(uw.x, uw.y);
+      if (d > R * 0.72) uw.va = Math.atan2(-uw.y, -uw.x) + (G.rng() - 0.5);
+    }
+
+    // mote spawn to cap, then drift
+    spawnAcc += 12 * dt;
+    while (spawnAcc >= 1) { spawnAcc -= 1; if (motes.length < MOTE_CAP) spawnMote(G); }
+    var lim = R * 0.98;
+    for (m = 0; m < motes.length; m++) {
+      mo = motes[m];
+      mo.vx += (G.rng() - 0.5) * 10 * dt; mo.vy += (G.rng() - 0.5) * 10 * dt;
+      mo.vx *= 1 - 0.4 * dt; mo.vy *= 1 - 0.4 * dt;
+      mo.x += mo.vx * dt; mo.y += mo.vy * dt;
+      d = mo.x * mo.x + mo.y * mo.y;
+      if (d > lim * lim) { d = Math.sqrt(d); mo.x *= lim / d; mo.y *= lim / d; }
+    }
+
+    // per-frame stat/radius cache
+    var n = cells.length;
+    for (i = 0; i < n; i++) {
+      c = cells[i];
+      if (c.dead) continue;
+      c._st = GEN.computeStats(c.genome);
+      c._r = GEN.radiusOf(c.biomass);
+    }
+
+    // AI + physics + metabolism + mote grazing
+    for (i = 0; i < n; i++) {
+      c = cells[i];
+      if (c.dead) continue;
+      st = c._st;
+      var r = c._r, isP = c === P;
+      c.age += dt;
+      if (c.flash > 0) c.flash = Math.max(0, c.flash - 3 * dt);
+
+      var des = c.angle, th = 0;
+      if (isP) {
+        th = Math.max(0, Math.min(1, inp.thrust || 0));
+        dx = inp.aimX - c.x; dy = inp.aimY - c.y;
+        if (dx * dx + dy * dy > 4) des = Math.atan2(dy, dx);
+      } else {
+        var ai = npcAI(G, c, st, r);
+        des = ai.a; th = ai.t;
+      }
+      // turn toward desired heading at st.turn rad/s
+      var dA = des - c.angle;
+      while (dA > Math.PI) dA -= TAU;
+      while (dA < -Math.PI) dA += TAU;
+      var mt = st.turn * dt;
+      c.angle += dA > mt ? mt : dA < -mt ? -mt : dA;
+      // accel = thrust*8/sqrt(mass); drag/s = 0.6+st.drag
+      var acc = st.thrust * 8 / Math.sqrt(st.mass) * th;
+      c.vx += Math.cos(c.angle) * acc * dt;
+      c.vy += Math.sin(c.angle) * acc * dt;
+      var dragF = Math.max(0, 1 - (0.6 + st.drag) * dt);
+      c.vx *= dragF; c.vy *= dragF;
+      // soft dish boundary: force grows past R*0.96, hard clamp at R
+      d = Math.hypot(c.x, c.y);
+      if (d > R * 0.96) {
+        var pf = (d - R * 0.96) * 3.2;
+        c.vx -= c.x / d * pf * dt;
+        c.vy -= c.y / d * pf * dt;
+        if (d > R) { c.x *= R / d; c.y *= R / d; }
+      }
+      c.x += c.vx * dt; c.y += c.vy * dt;
+
+      // metabolism / photosynthesis / mitochondria
+      c.energy -= (1.1 + 0.02 * st.mass + 2.2 * th) * dt;
+      if (st.photo > 0) {
+        c.energy += st.photo * 2.2 * W.light * dt;
+        if (isP) {
+          var nch = 0;
+          for (j = 1; j < 19; j++) if (c.genome[j] === 'chl') nch++;
+          addDna(G, 0.02 * nch * W.light * dt);
+        }
+      }
+      if (c.energy < 30 && c.biomass > 12 && st.mito > 0) {
+        c.biomass -= 0.5 * st.mito * dt;
+        c.energy += 4 * st.mito * dt;
+      }
+      if (c.energy > 100) c.energy = 100;
+      var mh = maxhpOf(G, c, st);
+      if (c.energy <= 0) { c.energy = 0; c.hp -= 2.5 * dt; }   // starvation
+      if (isP && G.perks.regen) c.hp += 1.2 * dt;
+      if (c.hp > mh) c.hp = mh;
+
+      // graze motes (point inside radius); swap-pop removal
+      for (m = motes.length - 1; m >= 0; m--) {
+        mo = motes[m];
+        dx = mo.x - c.x; dy = mo.y - c.y;
+        if (dx * dx + dy * dy < r * r) {
+          motes[m] = motes[motes.length - 1]; motes.pop();
+          c.biomass += 2;
+          c.energy = Math.min(100, c.energy + 14 * (isP && G.perks.enz ? 1.3 : 1));
+          if (isP) {
+            addDna(G, 0.25); G.stats.motes++;
+            if (hooks.sfx) hooks.sfx('eat');
+          }
+          if (hooks.fx) hooks.fx('eat', mo.x, mo.y, { hue: c.hue });
+        }
+      }
+      if (c.biomass > c.peak) c.peak = c.biomass;
+    }
+
+    // cell-cell contact: spikes, engulfing, gentle separation
+    for (i = 0; i < n; i++) {
+      var A = cells[i];
+      if (A.dead) continue;
+      for (j = i + 1; j < n; j++) {
+        if (A.dead) break;           // A drained to death mid-loop by a larger B
+        var B = cells[j];
+        if (B.dead) continue;
+        dx = B.x - A.x; dy = B.y - A.y;
+        var rA = A._r, rB = B._r, rr = rA + rB;
+        var d2 = dx * dx + dy * dy;
+        if (d2 > rr * rr) continue;
+        d = Math.sqrt(d2) || 0.001;
+        if (A._st.dmg > 0) { B.hp -= A._st.dmg * dt; B.flash = 1; }
+        if (B._st.dmg > 0) { A.hp -= B._st.dmg * dt; A.flash = 1; }
+        var ate = false;
+        if (rA > rB * 1.22 && d < rA * 0.85) { transfer(G, A, B, dt); ate = true; }
+        else if (rB > rA * 1.22 && d < rB * 0.85) { transfer(G, B, A, dt); ate = true; }
+        if (!ate) {
+          var ov = (rr - d) / rr * 60 * dt;
+          A.vx -= dx / d * ov; A.vy -= dy / d * ov;
+          B.vx += dx / d * ov; B.vy += dy / d * ov;
+        }
+      }
+    }
+
+    // deaths — also catches hp lost to combat's shots/viruses since last tick
+    for (i = cells.length - 1; i >= 0; i--) {
+      c = cells[i];
+      if (!c.dead && (c.hp <= 0 || c.biomass < 3)) die(G, c);
+      if (c.dead) cells.splice(i, 1);
+    }
+
+    // NPC division at own cap: two halves at 0.48 each, ONE child mutates
+    n = cells.length;
+    for (i = 0; i < n; i++) {
+      c = cells[i];
+      if (c.dead || c === P || !c._st) continue;
+      if (c.biomass >= c._st.cap && cells.length < CELL_CAP) {
+        var tot = c.biomass;
+        a = c.angle + Math.PI / 2;
+        var child = makeCell(G, c.species, GEN.mutate(c.genome, G.rng),
+          c.x + Math.cos(a) * c._r * 0.9, c.y + Math.sin(a) * c._r * 0.9, c.gen + 1);
+        child.biomass = child.peak = tot * 0.48;
+        child.energy = c.energy;
+        child.vx = c.vx + Math.cos(a) * 30; child.vy = c.vy + Math.sin(a) * 30;
+        c.biomass = tot * 0.48;
+        c.vx -= Math.cos(a) * 30; c.vy -= Math.sin(a) * 30;
+        cells.push(child);
+      }
+    }
+
+    // extinct species trickle back in at the rim (0.004/s each)
+    var alive = [false, false, false, false, false];
+    for (i = 0; i < cells.length; i++) alive[cells[i].species] = true;
+    for (var sp = 1; sp <= 4; sp++) {
+      if (!alive[sp] && cells.length < CELL_CAP && G.rng() < 0.004 * dt) {
+        a = G.rng() * TAU;
+        cells.push(makeCell(G, sp, template(sp), Math.cos(a) * R * 0.93, Math.sin(a) * R * 0.93, 0));
+      }
+    }
+
+    // player division readiness (rising edge fires the hook once) + stats
+    if (P && !P.dead) {
+      var pst = P._st || GEN.computeStats(P.genome);
+      if (P.biomass >= pst.cap) {
+        if (!G.divideReady) {
+          G.divideReady = true;
+          if (hooks.divideReady) hooks.divideReady();
+        }
+      } else G.divideReady = false;
+      if (G.stats) {
+        if (P.biomass > (G.stats.peakMass || 0)) G.stats.peakMass = P.biomass;
+        G.stats.timeAlive += dt;
+      }
+    }
+
+    // colony buds orbit the player; four bonded daughters = multicellularity
+    var buds = G.colonyBuds;
+    if (buds) {
+      for (i = 0; i < buds.length; i++) { buds[i].angle += 1.1 * dt; buds[i].phase += dt; }
+      if (!won && buds.length >= 4 && P && !P.dead) {
+        won = true;
+        if (hooks.fx) hooks.fx('bond', P.x, P.y, { hue: 48 });
+        if (hooks.sfx) hooks.sfx('win');
+        if (hooks.win) hooks.win();
+      }
+    }
+  }
+
+  return { init: init, update: update };
+})();
+
+/* ==== module: combat (solid) ==== */
+/* SPECK — combat.js: phage waves, virus homing AI, toxin shots, spike-vs-virus
+ * damage, and wave-clear rewards. Exact shared numbers honored:
+ *   waves: interval 75-4*n s (min 45), count 4+2*n, virus hp 8+n, reward 10+2*n
+ *   virus: speed 95 homing, 7 dps contact damage, retarget on target death
+ *   shots: speed 320, ttl 1.6, dmg 12 (player x1.5 with potent perk)
+ *   player fire cooldown: 0.55/(1+0.25*(shot-1))
+ * LOOP CAPS (per tick, worst case): cells 64, viruses 40, shots 80.
+ * Pair loops bounded: virus-cell 40*64=2560, shot-virus 80*40, shot-cell 80*64.
+ * All O(small) — comfortably 60fps on a 2019 iGPU. */
+window.SPECK = window.SPECK || { modules: {} };
+window.SPECK.modules.combat = (function () {
+  'use strict';
+  var GEN = window.SPECK.genome;
+
+  var VR = 7;              // virus body radius (px) for contact tests
+  var SHOT_SPEED = 320, SHOT_TTL = 1.6, SHOT_DMG = 12;
+  var VIRUS_SPEED = 95, VIRUS_DPS = 7, VIRUS_TURN = 3.2; // rad/s steering cap
+  var CAP_SHOTS = 80, CAP_VIRUSES = 40;
+
+  function fxh(G, type, x, y, opts) { if (G.hooks && G.hooks.fx) G.hooks.fx(type, x, y, opts); }
+  function sfxh(G, name) { if (G.hooks && G.hooks.sfx) G.hooks.sfx(name); }
+
+  // Spawn a phage wave at the dish rim, aimed at the 3 largest cells with a
+  // strong player bias. `cs` is the per-index alive-stats array from update().
+  function spawnWave(G, cells, cs) {
+    var w = G.wave;
+    var space = CAP_VIRUSES - G.viruses.length;   // respect virus cap 40
+    if (space <= 0) { w.next = 4; return; }       // saturated; retry shortly
+    var count = Math.min(4 + 2 * w.n, space);
+    var alive = [], i;
+    for (i = 0; i < cells.length; i++) if (cs[i]) alive.push(cells[i]);
+    alive.sort(function (a, b) { return b.biomass - a.biomass; });
+    var top = alive.slice(0, 3);
+    var pl = G.player, hp = 8 + w.n, R = G.world.R;
+    for (i = 0; i < count; i++) {
+      var t = (pl && !pl.dead && G.rng() < 0.6) ? pl
+            : (top.length ? top[(G.rng() * top.length) | 0] : pl);
+      var a = G.rng() * Math.PI * 2;
+      var x = Math.cos(a) * R * 0.99, y = Math.sin(a) * R * 0.99;
+      var da = t ? Math.atan2(t.y - y, t.x - x) : a + Math.PI;
+      G.viruses.push({ x: x, y: y,
+                       vx: Math.cos(da) * VIRUS_SPEED, vy: Math.sin(da) * VIRUS_SPEED,
+                       hp: hp, tid: t ? t.id : -1 });
+    }
+    w.active = true;
+    w.left = count;                                // "all spawned dead" tracker
+    fxh(G, 'wave', 0, 0, { n: w.n });
+    sfxh(G, 'wave');
+  }
+
+  function update(G, dt) {
+    if (!G || !G.player) return;
+    var cells = G.cells, vs = G.viruses, ss = G.shots;
+    var n = cells.length, i, j, c;
+
+    // Precompute per-cell stats/radius once (cells <= 64); tick fire cooldowns.
+    var cs = new Array(n), cr = new Array(n), byId = {};
+    for (i = 0; i < n; i++) {
+      c = cells[i];
+      if (c.dead) { cs[i] = null; continue; }
+      cs[i] = GEN.computeStats(c.genome);
+      cr[i] = GEN.radiusOf(c.biomass);
+      byId[c.id] = i;
+      if (c.cool.fire > 0) c.cool.fire -= dt;
+    }
+
+    // --- wave scheduling: G.wave.next is a countdown in seconds ---
+    var w = G.wave;
+    if (!w.active) {
+      w.next -= dt;
+      if (w.next <= 0) spawnWave(G, cells, cs);
+    }
+
+    // --- viruses: homing, contact drain (7 dps), spike dps taken ---
+    for (i = vs.length - 1; i >= 0; i--) {
+      var v = vs[i];
+      var ti = byId[v.tid];
+      if (ti == null) {                 // retarget on target death: nearest living cell
+        var bd = Infinity, bi = -1;
+        for (j = 0; j < n; j++) {
+          if (!cs[j]) continue;
+          var rx = cells[j].x - v.x, ry = cells[j].y - v.y;
+          var d2 = rx * rx + ry * ry;
+          if (d2 < bd) { bd = d2; bi = j; }
+        }
+        if (bi >= 0) { v.tid = cells[bi].id; ti = bi; }
+      }
+      if (ti != null && cs[ti]) {       // steer toward target at fixed speed 95
+        var tc = cells[ti];
+        var want = Math.atan2(tc.y - v.y, tc.x - v.x);
+        var cur = Math.atan2(v.vy, v.vx);
+        var diff = want - cur;
+        while (diff > Math.PI) diff -= 2 * Math.PI;
+        while (diff < -Math.PI) diff += 2 * Math.PI;
+        var mt = VIRUS_TURN * dt;
+        if (diff > mt) diff = mt; else if (diff < -mt) diff = -mt;
+        cur += diff;
+        v.vx = Math.cos(cur) * VIRUS_SPEED;
+        v.vy = Math.sin(cur) * VIRUS_SPEED;
+      }
+      v.x += v.vx * dt; v.y += v.vy * dt;
+      // contact with cells: drain 7 hp/s; spiked cells shred it at dmg dps
+      for (j = 0; j < n; j++) {
+        if (!cs[j]) continue;
+        c = cells[j];
+        var dx = c.x - v.x, dy = c.y - v.y;
+        var rr = cr[j] + VR * 0.5;
+        if (dx * dx + dy * dy < rr * rr) {
+          c.hp -= VIRUS_DPS * dt;
+          if (c.flash < 0.7) c.flash = 0.7;
+          if (cs[j].dmg > 0) v.hp -= cs[j].dmg * dt;   // spike contact kills viruses
+        }
+      }
+      if (v.hp <= 0) {
+        fxh(G, 'die', v.x, v.y, { hue: 320, small: true });
+        sfxh(G, 'pop');
+        vs.splice(i, 1);
+        if (w.active) w.left--;
+      }
+    }
+
+    // --- firing: player toxin gland toward aim; NPC glands at smaller prey ---
+    for (i = 0; i < n; i++) {
+      if (!cs[i]) continue;
+      c = cells[i];
+      var st = cs[i];
+      if (st.shot <= 0 || c.cool.fire > 0) continue;
+      if (ss.length >= CAP_SHOTS) break;             // respect shot cap 80
+      var ax, ay, dmg, cool;
+      if (c.species === 0) {
+        if (!G.input.fire) continue;
+        ax = G.input.aimX; ay = G.input.aimY;
+        dmg = SHOT_DMG * (G.perks.potent ? 1.5 : 1);
+        cool = 0.55 / (1 + 0.25 * (st.shot - 1));
+        sfxh(G, 'shot');
+      } else {
+        // nearest smaller living cell within sensor range 260+vision*400
+        var range = 260 + st.vision * 400, best = range * range, pi = -1;
+        for (j = 0; j < n; j++) {
+          if (j === i || !cs[j]) continue;
+          if (cr[j] >= cr[i]) continue;              // only smaller prey
+          var qx = cells[j].x - c.x, qy = cells[j].y - c.y;
+          var qd = qx * qx + qy * qy;
+          if (qd < best) { best = qd; pi = j; }
+        }
+        if (pi < 0) continue;
+        var tg = cells[pi];
+        var lead = Math.sqrt(best) / SHOT_SPEED * 0.6;  // rough intercept lead
+        ax = tg.x + tg.vx * lead; ay = tg.y + tg.vy * lead;
+        dmg = SHOT_DMG;
+        cool = 0.9 / (1 + 0.25 * (st.shot - 1));     // NPC glands cycle slower
+        sfxh(G, 'spit');
+      }
+      var da2 = Math.atan2(ay - c.y, ax - c.x);
+      var r0 = cr[i] + 4;                            // muzzle just past membrane
+      ss.push({ x: c.x + Math.cos(da2) * r0, y: c.y + Math.sin(da2) * r0,
+                vx: Math.cos(da2) * SHOT_SPEED, vy: Math.sin(da2) * SHOT_SPEED,
+                dmg: dmg, ttl: SHOT_TTL, from: c.id, hostile: c.species !== 0 });
+      c.cool.fire = cool;
+    }
+
+    // --- shots: move, expire, collide (viruses first, then cells) ---
+    var R2 = G.world.R * 1.02; R2 *= R2;             // nothing exists outside R
+    for (i = ss.length - 1; i >= 0; i--) {
+      var s = ss[i];
+      s.ttl -= dt; s.x += s.vx * dt; s.y += s.vy * dt;
+      if (s.ttl <= 0 || s.x * s.x + s.y * s.y > R2) { ss.splice(i, 1); continue; }
+      var hit = false;
+      for (j = vs.length - 1; j >= 0; j--) {         // shots kill viruses
+        var v2 = vs[j];
+        var hx = v2.x - s.x, hy = v2.y - s.y, hr = VR + 3;
+        if (hx * hx + hy * hy < hr * hr) {
+          v2.hp -= s.dmg;
+          fxh(G, 'hit', s.x, s.y, { hue: 320 });
+          if (v2.hp <= 0) {
+            fxh(G, 'die', v2.x, v2.y, { hue: 320, small: true });
+            sfxh(G, 'pop');
+            vs.splice(j, 1);
+            if (w.active) w.left--;
+          }
+          hit = true; break;
+        }
+      }
+      if (!hit) {                                    // hurt any cell that isn't the shooter
+        for (j = 0; j < n; j++) {
+          if (!cs[j]) continue;
+          c = cells[j];
+          if (c.id === s.from) continue;
+          var gx = c.x - s.x, gy = c.y - s.y;
+          if (gx * gx + gy * gy < cr[j] * cr[j]) {
+            c.hp -= s.dmg;                           // sim handles death/scatter at hp<=0
+            c.flash = 1;
+            fxh(G, 'hit', s.x, s.y, { hue: 285 });
+            sfxh(G, c === G.player ? 'hurt' : 'hit');
+            hit = true; break;
+          }
+        }
+      }
+      if (hit) ss.splice(i, 1);
+    }
+
+    // --- wave cleared: all spawned phages dead ---
+    if (w.active && w.left <= 0 && vs.length === 0) {
+      var reward = 10 + 2 * w.n;
+      G.dna += reward;
+      if (G.stats) { G.stats.waves++; G.stats.dnaEarned += reward; }
+      w.active = false;
+      w.n++;                                         // n = completed waves
+      w.next = Math.max(45, 75 - 4 * w.n);           // interval 75-4n, min 45
+      fxh(G, 'wave', G.player.x, G.player.y, { clear: true, n: w.n });
+      sfxh(G, 'clear');
+    }
+  }
+
+  return { update: update };
+})();
+
+/* ==== module: render (fixed) ==== */
+/* SPECK — render.js: camera, dish, motes, cells, viruses, shots, fx, light.
+ * Loop caps: shimmer dots 90 (fixed), motes <=240 (sim cap), cells <=64,
+ * shots <=80, viruses <=40, fx hard-capped at 120 here, die-burst 12 dots/fx.
+ * Composite batching: bg+rim (source-over) -> shimmer+motes (lighter) ->
+ * cells+buds (source-over) -> viruses+shots+fx (lighter) -> overlay+vignette.
+ */
+window.SPECK = window.SPECK || { modules: {} };
+window.SPECK.modules.render = (function () {
+  'use strict';
+  var GEN = window.SPECK.genome;
+  var TAU = Math.PI * 2;
+
+  // ---- decorative shimmer field (seeded locally so we never consume G.rng) ----
+  var SHIM_N = 90;                       // cap: 90 shimmer dots
+  var shim = null, shimSeed = null;
+  function mulberry(a) {                  // tiny deterministic PRNG, decorative only
+    a = a >>> 0;
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  function buildShim(G) {
+    shim = []; shimSeed = G.seed;
+    var rnd = mulberry(((G.seed || 1337) * 2654435761) >>> 0);
+    var R = (G.world && G.world.R) || 2600;
+    for (var i = 0; i < SHIM_N; i++) {
+      var a = rnd() * TAU, d = Math.sqrt(rnd()) * R * 0.96;
+      shim.push({ x: Math.cos(a) * d, y: Math.sin(a) * d,
+                  p: rnd() * TAU, q: rnd() * TAU, o: rnd() * 6 });
+    }
+  }
+
+  // ---- cached screen-space gradients ----
+  var bgGrad = null, vigGrad = null, gW = 0, gH = 0;
+  function rebuildGrads(ctx, W, H) {
+    gW = W; gH = H;
+    var m = Math.max(W, H);
+    bgGrad = ctx.createRadialGradient(W / 2, H / 2, 0, W / 2, H / 2, m * 0.72);
+    bgGrad.addColorStop(0, '#061018');
+    bgGrad.addColorStop(1, '#02050a');
+    vigGrad = ctx.createRadialGradient(W / 2, H / 2, Math.min(W, H) * 0.42, W / 2, H / 2, m * 0.72);
+    vigGrad.addColorStop(0, 'rgba(0,0,0,0)');
+    vigGrad.addColorStop(1, 'rgba(0,0,0,0.42)');
+  }
+
+  // ---- camera memory ----
+  var camInit = false, lastX = 0, lastY = 0, lastTZ = 0.6;
+
+  function draw(G, ctx, W, H, dt) {
+    if (!G || !ctx || !G.world) return;
+    if (!shim || shimSeed !== G.seed) buildShim(G);
+    if (W !== gW || H !== gH || !bgGrad) rebuildGrads(ctx, W, H);
+    var t = G.time || 0, R = G.world.R, p = G.player;
+
+    // ---------- camera: follow player (lerp 4/s), zoom lerp 2/s ----------
+    if (p && !p.dead) {
+      lastX = p.x; lastY = p.y;
+      var pst = GEN.computeStats(p.genome);
+      var pr = GEN.radiusOf(p.biomass);
+      // player diameter ~17% of min(W,H), scaled by 1/vision
+      lastTZ = (0.17 * Math.min(W, H)) / (2 * pr) / Math.max(0.35, pst.vision);
+    } // dead: hold corpse site + last zoom target
+    lastTZ = Math.min(20, Math.max(0.12, lastTZ)); // sanity guard only
+    var cam = G.cam;
+    if (!camInit || !(cam.zoom > 0) || !isFinite(cam.zoom)) {
+      cam.x = lastX; cam.y = lastY; cam.zoom = lastTZ; camInit = true;
+    }
+    var kp = 1 - Math.exp(-4 * dt), kz = 1 - Math.exp(-2 * dt);
+    cam.x += (lastX - cam.x) * kp;
+    cam.y += (lastY - cam.y) * kp;
+    cam.zoom += (lastTZ - cam.zoom) * kz;
+    var z = cam.zoom;
+
+    // ---------- deep-water background (screen space) ----------
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = bgGrad;
+    ctx.fillRect(0, 0, W, H);
+
+    // ---------- world transform + view culling rect ----------
+    ctx.save();
+    ctx.translate(W / 2, H / 2);
+    ctx.scale(z, z);
+    ctx.translate(-cam.x, -cam.y);
+    var hw = W / (2 * z), hh = H / (2 * z);
+    var vx0 = cam.x - hw - 40, vx1 = cam.x + hw + 40;
+    var vy0 = cam.y - hh - 40, vy1 = cam.y + hh + 40;
+
+    // ---------- dish rim: glowing circle at R ----------
+    var camd = Math.hypot(cam.x, cam.y);
+    if (camd + Math.hypot(hw, hh) > R * 0.82) {   // skip when rim fully offscreen
+      ctx.beginPath(); ctx.arc(0, 0, R, 0, TAU);
+      ctx.strokeStyle = 'rgba(110,190,255,0.08)'; ctx.lineWidth = 26; ctx.stroke();
+      ctx.strokeStyle = 'rgba(130,205,255,0.5)'; ctx.lineWidth = 5; ctx.stroke();
+      ctx.strokeStyle = 'rgba(80,140,200,0.16)'; ctx.lineWidth = 12; ctx.stroke();
+    }
+
+    // ---------- additive pass 1: shimmer + motes (batched paths) ----------
+    ctx.globalCompositeOperation = 'lighter';
+    var i, m, sx, sy;
+    // nutrient shimmer — decorative drifting dots
+    var shr = Math.max(1, 1.6 / z);
+    ctx.fillStyle = 'rgba(110,175,215,0.07)';
+    ctx.beginPath();
+    for (i = 0; i < SHIM_N; i++) {
+      var sd = shim[i];
+      sx = sd.x + Math.sin(t * 0.07 + sd.p) * 34;
+      sy = sd.y + Math.cos(t * 0.055 + sd.q) * 34;
+      if (sx < vx0 || sx > vx1 || sy < vy0 || sy > vy1) continue;
+      var ss = shr * (1.2 + 0.8 * Math.sin(t * 0.9 + sd.o));
+      ctx.moveTo(sx + ss, sy); ctx.arc(sx, sy, ss, 0, TAU);
+    }
+    ctx.fill();
+    // motes: 2px glow dots (screen-constant size), glow batch + core batch
+    var motes = G.world.motes || [];
+    var mg = 4.5 / z, mc = 2 / z;
+    ctx.fillStyle = 'rgba(120,220,255,0.14)';
+    ctx.beginPath();
+    for (i = 0; i < motes.length; i++) {
+      m = motes[i];
+      if (m.x < vx0 || m.x > vx1 || m.y < vy0 || m.y > vy1) continue;
+      ctx.moveTo(m.x + mg, m.y); ctx.arc(m.x, m.y, mg, 0, TAU);
+    }
+    ctx.fill();
+    ctx.fillStyle = 'rgba(195,240,255,0.9)';
+    ctx.beginPath();
+    for (i = 0; i < motes.length; i++) {
+      m = motes[i];
+      if (m.x < vx0 || m.x > vx1 || m.y < vy0 || m.y > vy1) continue;
+      ctx.moveTo(m.x + mc, m.y); ctx.arc(m.x, m.y, mc, 0, TAU);
+    }
+    ctx.fill();
+
+    // ---------- cells (source-over), player last, skip offscreen ----------
+    ctx.globalCompositeOperation = 'source-over';
+    var cells = G.cells || [], c, cr;
+    for (i = 0; i < cells.length; i++) {
+      c = cells[i];
+      if (!c || c.dead || c === p) continue;
+      cr = GEN.radiusOf(c.biomass);
+      if (c.x + cr * 2 < vx0 || c.x - cr * 2 > vx1 || c.y + cr * 2 < vy0 || c.y - cr * 2 > vy1) continue;
+      GEN.drawCell(ctx, c.x, c.y, c.angle, cr, c.genome, c.hue, t,
+                   { alpha: 1, flash: c.flash > 0 ? Math.min(1, c.flash) : 0 });
+    }
+    // colony buds: mini player-genome cells orbiting the player
+    if (p && !p.dead) {
+      var buds = G.colonyBuds || [];
+      var ppr = GEN.radiusOf(p.biomass);
+      for (i = 0; i < buds.length; i++) {
+        var b = buds[i];
+        var bd = ppr + 24 + Math.sin(t * 2 + (b.phase || 0)) * 3;
+        var bx = p.x + Math.cos(b.angle) * bd, by = p.y + Math.sin(b.angle) * bd;
+        ctx.strokeStyle = 'rgba(255,209,102,0.45)';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(p.x + Math.cos(b.angle) * ppr * 0.9, p.y + Math.sin(b.angle) * ppr * 0.9);
+        ctx.lineTo(bx, by); ctx.stroke();
+        GEN.drawCell(ctx, bx, by, b.angle, 11, p.genome, p.hue, t + i * 1.7, { alpha: 0.95 });
+      }
+      GEN.drawCell(ctx, p.x, p.y, p.angle, ppr, p.genome, p.hue, t,
+                   { alpha: 1, flash: p.flash > 0 ? Math.min(1, p.flash) : 0 });
+    }
+
+    // ---------- additive pass 2: viruses, shots, fx ----------
+    ctx.globalCompositeOperation = 'lighter';
+    // viruses: spiky icosa-ish wisps, hue 320
+    var vs = G.viruses || [], v;
+    for (i = 0; i < vs.length; i++) {
+      v = vs[i];
+      if (v.x < vx0 || v.x > vx1 || v.y < vy0 || v.y > vy1) continue;
+      ctx.fillStyle = 'hsla(320,90%,60%,0.10)';
+      ctx.beginPath(); ctx.arc(v.x, v.y, 14, 0, TAU); ctx.fill();
+      var rot = t * 2.6 + (i * 1.31);
+      ctx.fillStyle = 'hsla(320,85%,64%,0.75)';
+      ctx.beginPath();
+      for (var k2 = 0; k2 < 10; k2++) {
+        var va = rot + (k2 / 10) * TAU;
+        var vr = (k2 & 1) ? 3.6 : 8.5 + Math.sin(t * 6 + k2 + i) * 1.3;
+        if (k2 === 0) ctx.moveTo(v.x + Math.cos(va) * vr, v.y + Math.sin(va) * vr);
+        else ctx.lineTo(v.x + Math.cos(va) * vr, v.y + Math.sin(va) * vr);
+      }
+      ctx.closePath(); ctx.fill();
+      ctx.fillStyle = 'hsla(320,60%,90%,0.85)';
+      ctx.beginPath(); ctx.arc(v.x, v.y, 2.6, 0, TAU); ctx.fill();
+    }
+    // shots: glow streaks along velocity (screen-constant width)
+    var shots = G.shots || [], s;
+    ctx.lineCap = 'round';
+    for (i = 0; i < shots.length; i++) {
+      s = shots[i];
+      if (s.x < vx0 || s.x > vx1 || s.y < vy0 || s.y > vy1) continue;
+      var hue = s.hostile ? 285 : 190;
+      var tx = s.x - s.vx * 0.055, ty = s.y - s.vy * 0.055;
+      ctx.strokeStyle = 'hsla(' + hue + ',95%,62%,0.25)';
+      ctx.lineWidth = 6 / z;
+      ctx.beginPath(); ctx.moveTo(tx, ty); ctx.lineTo(s.x, s.y); ctx.stroke();
+      ctx.strokeStyle = 'hsla(' + hue + ',95%,78%,0.95)';
+      ctx.lineWidth = 2 / z;
+      ctx.beginPath(); ctx.moveTo(tx, ty); ctx.lineTo(s.x, s.y); ctx.stroke();
+    }
+    // fx: render consumes G.fx (cap 120; expired entries removed here)
+    var fx = G.fx || [];
+    if (fx.length > 120) fx.splice(0, fx.length - 120);
+    for (i = fx.length - 1; i >= 0; i--) {
+      var f = fx[i];
+      var dur = f.type === 'die' ? 0.9 : f.type === 'bond' ? 1.15 :
+                f.type === 'wave' ? 2.2 : f.type === 'hit' ? 0.38 :
+                f.type === 'eat' ? 0.45 : 0.5;
+      var age = t - (f.t0 == null ? t : f.t0);
+      if (age < 0) age = 0;
+      if (age >= dur) { fx.splice(i, 1); continue; }
+      var k = age / dur, fade = 1 - k, ez = 1 - (1 - k) * (1 - k);
+      var fh = f.hue;
+      if (f.type === 'eat') {           // sparkle: 5 short expanding rays
+        ctx.strokeStyle = 'hsla(' + (fh == null ? 55 : fh) + ',95%,70%,' + (fade * 0.9).toFixed(3) + ')';
+        ctx.lineWidth = 1.4;
+        ctx.beginPath();
+        for (var e5 = 0; e5 < 5; e5++) {
+          var ea = e5 * (TAU / 5) + (f.t0 || 0);
+          var r0 = 2 + 4 * ez, r1 = 5 + 11 * ez;
+          ctx.moveTo(f.x + Math.cos(ea) * r0, f.y + Math.sin(ea) * r0);
+          ctx.lineTo(f.x + Math.cos(ea) * r1, f.y + Math.sin(ea) * r1);
+        }
+        ctx.stroke();
+      } else if (f.type === 'die') {    // burst of 12 fading dots (cap)
+        ctx.fillStyle = 'hsla(' + (fh == null ? 25 : fh) + ',85%,62%,' + (fade * 0.85).toFixed(3) + ')';
+        ctx.beginPath();
+        for (var d12 = 0; d12 < 12; d12++) {
+          var da = d12 * 2.399 + (f.t0 || 0) * 13;
+          var dd = (26 + (d12 % 3) * 15) * ez;
+          var dr = 2.6 * fade + 0.4;
+          var dxp = f.x + Math.cos(da) * dd, dyp = f.y + Math.sin(da) * dd;
+          ctx.moveTo(dxp + dr, dyp); ctx.arc(dxp, dyp, dr, 0, TAU);
+        }
+        ctx.fill();
+      } else if (f.type === 'hit') {    // flash ring
+        ctx.strokeStyle = 'hsla(' + (fh == null ? 5 : fh) + ',95%,66%,' + (fade * 0.8).toFixed(3) + ')';
+        ctx.lineWidth = 2.5;
+        ctx.beginPath(); ctx.arc(f.x, f.y, 5 + 26 * ez, 0, TAU); ctx.stroke();
+      } else if (f.type === 'bond') {   // golden ring pulse
+        ctx.strokeStyle = 'hsla(46,95%,62%,' + (fade * 0.9).toFixed(3) + ')';
+        ctx.lineWidth = 3;
+        ctx.beginPath(); ctx.arc(f.x, f.y, 8 + 40 * ez, 0, TAU); ctx.stroke();
+        ctx.strokeStyle = 'hsla(46,95%,75%,' + (fade * 0.5).toFixed(3) + ')';
+        ctx.lineWidth = 1.5;
+        ctx.beginPath(); ctx.arc(f.x, f.y, 4 + 22 * ez, 0, TAU); ctx.stroke();
+      } else if (f.type === 'wave') {   // rim ripple on the dish edge
+        ctx.strokeStyle = 'hsla(320,90%,62%,' + (fade * 0.3).toFixed(3) + ')';
+        ctx.lineWidth = 10 + 70 * k;
+        ctx.beginPath(); ctx.arc(0, 0, R, 0, TAU); ctx.stroke();
+        ctx.strokeStyle = 'hsla(320,90%,70%,' + (fade * 0.25).toFixed(3) + ')';
+        ctx.lineWidth = 4;
+        ctx.beginPath(); ctx.arc(0, 0, Math.max(40, R - 260 * ez), 0, TAU); ctx.stroke();
+      } else {                          // unknown fx: soft fading dot
+        ctx.fillStyle = 'hsla(' + (fh == null ? 190 : fh) + ',80%,65%,' + (fade * 0.6).toFixed(3) + ')';
+        ctx.beginPath(); ctx.arc(f.x, f.y, 4 + 8 * ez, 0, TAU); ctx.fill();
+      }
+    }
+
+    ctx.restore();
+
+    // ---------- light cycle overlay + vignette (screen space) ----------
+    ctx.globalCompositeOperation = 'source-over';
+    var la = (1 - (G.world.light || 0)) * 0.35;
+    if (la > 0.004) {
+      ctx.fillStyle = 'rgba(4,8,18,' + la.toFixed(3) + ')';
+      ctx.fillRect(0, 0, W, H);
+    }
+    ctx.fillStyle = vigGrad;
+    ctx.fillRect(0, 0, W, H);
+  }
+
+  return { draw: draw };
+})();
+
+/* ==== module: ui (fixed) ==== */
+/* SPECK — ui.js: every scrap of DOM. Screens: title / mutate (hex genome
+ * editor) / tree (4-era tech tree) / dead / win, plus the in-play HUD.
+ * Exports: { init(G,root), show(G,name), hud(G) }.
+ * Loop caps: exactly ONE rAF loop (mutate preview — a single drawCell per
+ * frame on a 220px canvas), killed the instant the screen changes. hud()
+ * runs ~10Hz on a fixed, cached node set — zero DOM creation per call.
+ * Tree and mutate panels rebuild only when opened / on purchase. */
+window.SPECK = window.SPECK || { modules: {} };
+window.SPECK.modules.ui = (function () {
+  'use strict';
+  var GEN = window.SPECK.genome;
+  var Gref = null, root = null, E = {}, editG = null, raf = 0, cur = 'title';
+  var ERAS = ['Primordial Soup', 'Age of Light', 'Predation', 'Threshold of Many'];
+  var ACC = ['#8fd8ff', '#7ce27a', '#ff6f5c', '#ffd166'];
+  var ORDER = ['fla', 'vac', 'cil', 'sen', 'chl', 'mit', 'mem', 'spk', 'tox', 'adh'];
+  var PERKS = {
+    enz:    { name: 'Enzymes',      era: 1, dna: 8,  desc: '+30% mote energy' },
+    buoy:   { name: 'Buoyancy',     era: 2, dna: 10, desc: '-0.1 drag' },
+    visc:   { name: 'Viscous Gel',  era: 3, dna: 16, desc: '+25% max HP' },
+    regen:  { name: 'Regeneration', era: 4, dna: 20, desc: 'Slow constant healing' },
+    potent: { name: 'Potent Toxin', era: 4, dna: 22, desc: '+50% toxin damage' }
+  };
+  var SKEYS = ['thrust','turn','cap','vision','armor','dmg','photo','mito','shot','adhesin','drag','mass'];
+  var GOODLOW = { drag: 1, mass: 1 };   // for these, a lower number reads green
+  var HS = 27, HC = 125;                // hex editor: px per genome unit, wrap center
+
+  var CSS = [
+    '.skui{position:fixed;inset:0;pointer-events:none;z-index:10;color:#d5d9e0;--acc:#8fd8ff;',
+    'font:14px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;-webkit-user-select:none;user-select:none}',
+    '.skui *{box-sizing:border-box;margin:0}',
+    '.skui .scr{position:absolute;inset:0;display:none;align-items:center;justify-content:center;background:rgba(2,5,10,.6);pointer-events:auto}',
+    '.skui .pnl{background:#0b0c10;border:1px solid #222a3c;border-radius:12px;padding:26px 32px;max-width:min(920px,94vw);',
+    'max-height:92vh;overflow:auto;box-shadow:0 10px 60px rgba(0,0,0,.75),0 0 30px rgba(120,180,255,.05)}',
+    '.skui .ttl{font-size:64px;font-weight:200;letter-spacing:.45em;text-indent:.45em;text-align:center;color:var(--acc);text-shadow:0 0 26px rgba(140,220,255,.5)}',
+    '.skui .ttl2{font-size:28px;font-weight:300;letter-spacing:.3em;text-align:center;margin-bottom:6px}',
+    '.skui .red{color:#ff7a6b}.skui .gold{color:#ffd166;text-shadow:0 0 20px rgba(255,209,102,.45)}',
+    '.skui .tag{text-align:center;color:#8b93a5;font-size:13px;letter-spacing:.14em;margin:10px 0 20px}',
+    '.skui .keys{text-align:center;color:#5b6478;font-size:11px;letter-spacing:.12em;margin-top:16px}',
+    '.skui .h1{font-size:15px;letter-spacing:.24em;color:var(--acc)}',
+    '.skui button{pointer-events:auto;font:inherit;color:#d5d9e0;background:#12151f;border:1px solid #2a3247;border-radius:7px;padding:8px 18px;cursor:pointer;letter-spacing:.12em}',
+    '.skui button:hover{background:#1a2030;border-color:var(--acc)}',
+    '.skui .big{display:block;margin:6px auto 0;font-size:15px;padding:12px 34px}',
+    '.skui .acc{border-color:var(--acc);color:var(--acc);box-shadow:0 0 14px rgba(140,220,255,.15)}',
+    '.skui .btnrow{display:flex;gap:12px;justify-content:center;margin-top:18px}',
+    '.skui .mrow{display:flex;gap:26px;align-items:center;flex-wrap:wrap;justify-content:center;margin-top:16px}',
+    '.skui .hexw{position:relative;width:250px;height:250px;flex:none}',
+    '.skui .hx{position:absolute;width:44px;height:50px;transform:translate(-50%,-50%);clip-path:polygon(50% 0,100% 25%,100% 75%,50% 100%,0 75%,0 25%);',
+    'background:#101320;box-shadow:inset 0 0 0 2px #232a3a;display:flex;align-items:center;justify-content:center;font-size:9px;letter-spacing:.05em;color:#5b6478;cursor:pointer}',
+    '.skui .hx:hover{filter:brightness(1.7)}',
+    '.skui .hx.nuc{background:#080a10;color:#39415a;cursor:default}.skui .hx.nuc:hover{filter:none}',
+    '.skui .pal{position:absolute;z-index:6;width:186px;max-height:232px;overflow:auto;background:#0e1016;border:1px solid #2a3247;border-radius:8px;padding:6px;box-shadow:0 8px 30px rgba(0,0,0,.7)}',
+    '.skui .ph{font-size:10px;letter-spacing:.2em;color:#8b93a5;padding:2px 7px 6px}',
+    '.skui .pi{display:flex;align-items:center;gap:8px;width:100%;padding:5px 7px;background:none;border:none;font-size:12px;text-align:left;border-radius:5px;letter-spacing:0}',
+    '.skui .pi:hover{background:#1a2030;border:none}',
+    '.skui .dot{width:10px;height:10px;border-radius:50%;flex:none}',
+    '.skui .pm{margin-left:auto;color:#5b6478;font-size:10px}',
+    '.skui .pv{width:220px;height:220px;border-radius:50%;background:radial-gradient(circle at 50% 42%,#0a1626,#04070d 75%);border:1px solid #1c2436;flex:none}',
+    '.skui .stt{min-width:200px;font-size:12px}',
+    '.skui .sh{font-size:10px;letter-spacing:.22em;color:#8b93a5;margin-bottom:6px}',
+    '.skui .sr{display:flex;justify-content:space-between;gap:18px;padding:2px 0;border-bottom:1px solid #12151f}',
+    '.skui .up{color:#7ce27a;font-weight:600}.skui .dn{color:#ff7a6b;font-weight:600}',
+    '.skui .mhint{font-size:11px;color:#5b6478;text-align:center;margin-top:8px;letter-spacing:.08em}',
+    '.skui .h1row{display:flex;justify-content:space-between;align-items:baseline;gap:20px;margin-bottom:12px}',
+    '.skui .tdna{color:var(--acc);font-size:16px;letter-spacing:.1em}',
+    '.skui .cols{display:flex;gap:12px;align-items:stretch;flex-wrap:wrap}',
+    '.skui .col{flex:1;min-width:170px;background:#0e1016;border:1px solid #1a2030;border-radius:0 0 8px 8px;padding:10px}',
+    '.skui .col.shut{opacity:.45}',
+    '.skui .ch{font-size:11px;letter-spacing:.18em;margin-bottom:8px;text-transform:uppercase}',
+    '.skui .req{font-size:10px;color:#5b6478;margin-bottom:6px}',
+    '.skui .node{display:block;width:100%;text-align:left;margin:0 0 7px;padding:7px 9px;font-size:12px;letter-spacing:0}',
+    '.skui .node .nc{float:right;color:var(--acc);font-size:11px}',
+    '.skui .node .nd{display:block;color:#8b93a5;font-size:10px;margin-top:2px}',
+    '.skui .node.own{border-color:#2f6d4a;background:#0f1a15;cursor:default}.skui .node.own .nc{color:#7ce27a}',
+    '.skui .node.own:hover{background:#0f1a15;border-color:#2f6d4a}',
+    '.skui .node.lok{opacity:.45;cursor:default}.skui .node.lok:hover{background:#12151f;border-color:#2a3247}',
+    '.skui .hud{display:none;position:absolute;inset:0}',
+    '.skui .hudbars{position:absolute;top:14px;left:16px;width:240px}',
+    '.skui .brow{margin-bottom:7px}',
+    '.skui .blab{font-size:9px;letter-spacing:.22em;color:#8b93a5;margin-bottom:2px}',
+    '.skui .bar{height:9px;background:rgba(11,12,16,.8);border:1px solid #232a3a;border-radius:5px;overflow:hidden}',
+    '.skui .bar i{display:block;height:100%;width:0;border-radius:4px;transition:width .15s linear}',
+    '.skui .brow.rdy .bar{border-color:var(--acc);animation:skpulse 1s infinite}',
+    '.skui .brow.rdy .blab{color:var(--acc);animation:skblink 1s infinite}',
+    '@keyframes skpulse{0%,100%{box-shadow:0 0 4px var(--acc)}50%{box-shadow:0 0 16px var(--acc)}}',
+    '@keyframes skblink{50%{opacity:.4}}',
+    '.skui .hudtr{position:absolute;top:14px;right:18px;text-align:right}',
+    '.skui .dna{font-size:22px;font-weight:300;color:var(--acc);letter-spacing:.06em;text-shadow:0 0 12px rgba(140,220,255,.4)}',
+    '.skui .era{font-size:10px;letter-spacing:.24em;color:#8b93a5;text-transform:uppercase;margin:2px 0 6px}',
+    '.skui .pips{display:flex;gap:6px;justify-content:flex-end}',
+    '.skui .pip{width:9px;height:9px;border-radius:50%;border:1px solid #3a4258;display:inline-block}',
+    '.skui .pip.on{background:#ffd166;border-color:#ffd166;box-shadow:0 0 8px #ffd166}',
+    '.skui .wave{margin-top:8px;font-size:11px;letter-spacing:.14em;min-height:16px}',
+    '.skui .wave.soon{color:#ffd166}',
+    '.skui .wave.on{color:#ff5c8a;font-size:14px;letter-spacing:.3em;animation:skblink .8s infinite}',
+    '.skui .hint{position:absolute;bottom:12px;left:0;right:0;text-align:center;font-size:11px;letter-spacing:.14em;color:#79839a;text-shadow:0 1px 4px #000}',
+    '.skui .tab{margin:14px auto 4px;max-width:340px;font-size:13px}'
+  ].join('\n');
+
+  function el(tag, cls, html, par) {
+    var e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (html != null) e.innerHTML = html;
+    if (par) par.appendChild(e);
+    return e;
+  }
+  function hook(n, a) { var f = Gref && Gref.hooks && Gref.hooks[n]; if (f) return f(a); }
+  function closeScr() {  // tree CLOSE / mutate CANCEL: prefer main's hook if provided
+    if (Gref.hooks && Gref.hooks.uiClose) Gref.hooks.uiClose();
+    else { Gref.screen = 'play'; show(Gref, 'play'); }
+  }
+  function fmtN(v) { return Math.round(v * 100) / 100; }
+  function fmtT(s) { s = Math.max(0, Math.floor(s)); return Math.floor(s / 60) + ':' + ('0' + (s % 60)).slice(-2); }
+
+  // ---------- build (once) ----------
+  function buildTitle() {
+    var p = el('div', 'pnl', null, E.title = el('div', 'scr', null, root));
+    el('div', 'ttl', 'SPECK', p);
+    el('div', 'tag', 'a very small evolution — eat, grow, divide, become many', p);
+    el('button', 'big acc', 'CLICK TO BEGIN', p).onclick = function () { hook('uiStart'); };
+    el('div', 'keys', 'swim — WASD / mouse &nbsp;·&nbsp; divide — E &nbsp;·&nbsp; evolution tree — T', p);
+  }
+  function buildMutate() {
+    var p = el('div', 'pnl', null, E.mut = el('div', 'scr', null, root));
+    el('div', 'h1', 'DIVISION — SCRIBE THE DAUGHTER GENOME', p);
+    var row = el('div', 'mrow', null, p);
+    var lc = el('div', null, null, row);
+    E.hexw = el('div', 'hexw', null, lc);
+    el('div', 'mhint', 'click a slot to place an organelle', lc);
+    E.pv = el('canvas', 'pv', null, row); E.pv.width = 220; E.pv.height = 220;
+    E.stt = el('div', 'stt', null, row);
+    E.pal = el('div', 'pal', null, E.hexw); E.pal.style.display = 'none';
+    E.pal.onclick = function (ev) { ev.stopPropagation(); };
+    var br = el('div', 'btnrow', null, p);
+    el('button', 'big acc', 'CONFIRM DIVISION', br).onclick = function () { hook('uiDivide', editG.slice()); };
+    el('button', 'big', 'CANCEL', br).onclick = closeScr;
+    E.hx = [];
+    for (var i = 0; i < 19; i++) (function (i) {
+      var h = el('div', 'hx' + (i === 0 ? ' nuc' : ''), i === 0 ? '&#9679;' : '', E.hexw);
+      h.style.left = (HC + GEN.POS[i].x * HS) + 'px';
+      h.style.top = (HC + GEN.POS[i].y * HS) + 'px';
+      if (i > 0) h.onclick = function (ev) { ev.stopPropagation(); openPal(i); };
+      E.hx.push(h);
+    })(i);
+    E.mut.addEventListener('click', function () { E.pal.style.display = 'none'; });
+  }
+  function buildTree() {
+    var p = el('div', 'pnl', null, E.tree = el('div', 'scr', null, root));
+    var hd = el('div', 'h1row', null, p);
+    el('div', 'h1', 'EVOLUTION TREE', hd);
+    E.tdna = el('div', 'tdna', '', hd);
+    E.cols = el('div', 'cols', null, p);
+    E.cols.onclick = function (ev) {
+      var b = ev.target && ev.target.closest ? ev.target.closest('.node.buy') : null;
+      if (!b) return;
+      hook('uiBuy', b.getAttribute('data-id'));  // main validates & deducts
+      renderTree(Gref);
+    };
+    var br = el('div', 'btnrow', null, p);
+    el('button', null, 'CLOSE', br).onclick = closeScr;
+  }
+  function buildEnd() {
+    var p = el('div', 'pnl', null, E.dead = el('div', 'scr', null, root));
+    el('div', 'ttl2 red', 'LINEAGE SEVERED', p);
+    el('div', 'tag', 'the dish forgets nothing — a cousin cell stirs', p);
+    E.dtab = el('div', 'tab', null, p);
+    el('button', 'big acc', 'CONTINUE LINEAGE', p).onclick = function () { hook('uiRespawn'); };
+    p = el('div', 'pnl', null, E.win = el('div', 'scr', null, root));
+    el('div', 'ttl2 gold', 'MULTICELLULARITY', p);
+    el('div', 'tag', 'four daughters bonded — a body, of sorts', p);
+    E.wtab = el('div', 'tab', null, p);
+    el('button', 'big acc', 'KEEP SWIMMING', p).onclick = function () { hook('uiContinue'); };
+  }
+  function mkBar(par, label, color) {
+    var w = el('div', 'brow', null, par);
+    var lab = el('div', 'blab', label, w);
+    var f = el('i', null, null, el('div', 'bar', null, w));
+    f.style.background = color;
+    return { w: w, lab: lab, fill: f };
+  }
+  function buildHud() {
+    var h = E.hud = el('div', 'hud', null, root);
+    var bars = el('div', 'hudbars', null, h);
+    E.bio = mkBar(bars, 'BIOMASS', 'var(--acc)');
+    E.nrg = mkBar(bars, 'ENERGY', '#9be27a');
+    E.hp = mkBar(bars, 'INTEGRITY', '#ff7a6b');
+    var tr = el('div', 'hudtr', null, h);
+    E.hdna = el('div', 'dna', '0 DNA', tr);
+    E.hera = el('div', 'era', ERAS[0], tr);
+    E.pips = el('div', 'pips', null, tr);
+    for (var i = 0; i < 4; i++) el('span', 'pip', null, E.pips);
+    E.wave = el('div', 'wave', null, tr);
+    E.hint = el('div', 'hint', null, h);
+  }
+
+  // ---------- mutate screen ----------
+  function openPal(i) {
+    E.pal.innerHTML = '';
+    el('div', 'ph', 'SLOT ' + i, E.pal);
+    for (var k = 0; k < ORDER.length; k++) (function (id) {
+      if (!Gref.unlocked[id]) return;
+      var o = GEN.ORGANELLES[id];
+      var b = el('button', 'pi', '<span class="dot" style="background:' + o.color + '"></span>' +
+        o.name + '<span class="pm">' + o.mass + ' mass</span>', E.pal);
+      b.title = o.desc;
+      b.onclick = function (ev) { ev.stopPropagation(); editG[i] = id; E.pal.style.display = 'none'; refreshMut(); };
+    })(ORDER[k]);
+    el('button', 'pi', '<span class="dot" style="background:#333a4a"></span>Remove', E.pal)
+      .onclick = function (ev) { ev.stopPropagation(); editG[i] = null; E.pal.style.display = 'none'; refreshMut(); };
+    var px = HC + GEN.POS[i].x * HS, py = HC + GEN.POS[i].y * HS;
+    E.pal.style.left = (px > HC ? px - 210 : px + 28) + 'px';
+    E.pal.style.top = Math.max(-16, Math.min(90, py - 36)) + 'px';
+    E.pal.style.display = 'block';
+  }
+  function refreshMut() {
+    for (var i = 1; i < 19; i++) {
+      var id = editG[i], h = E.hx[i];
+      if (id && GEN.ORGANELLES[id]) {
+        var c = GEN.ORGANELLES[id].color;
+        h.style.background = c + '2b';
+        h.style.boxShadow = 'inset 0 0 0 2px ' + c;
+        h.style.color = c;
+        h.textContent = id.toUpperCase();
+      } else {
+        h.style.background = ''; h.style.boxShadow = ''; h.style.color = ''; h.textContent = '';
+      }
+    }
+    var a = GEN.computeStats(Gref.player.genome), b = GEN.computeStats(editG);
+    var html = '<div class="sh">DAUGHTER STATS</div>';
+    for (var k = 0; k < SKEYS.length; k++) {
+      var key = SKEYS[k], d = fmtN(b[key] - a[key]);
+      var cls = !d ? '' : ((d > 0) !== !!GOODLOW[key] ? 'up' : 'dn');
+      html += '<div class="sr"><span>' + key + '</span><span>' + fmtN(b[key]) +
+        (d ? ' <b class="' + cls + '">' + (d > 0 ? '+' : '') + d + '</b>' : '') + '</span></div>';
+    }
+    E.stt.innerHTML = html;
+  }
+  function pvLoop() {
+    if (cur !== 'mutate') { raf = 0; return; }   // the only rAF loop; self-terminates
+    var ctx = E.pv.getContext('2d');
+    ctx.clearRect(0, 0, 220, 220);
+    var r = Math.min(72, GEN.radiusOf(Gref.player.biomass));
+    GEN.drawCell(ctx, 110, 110, -Math.PI / 2, r, editG, Gref.player.hue, performance.now() / 1000, { ghost: true });
+    raf = requestAnimationFrame(pvLoop);
+  }
+
+  // ---------- tree screen ----------
+  function eraCount(G, e) {   // purchases only: the free starting fla (dna 0) never counts
+    var n = 0, k;
+    for (k in GEN.ORGANELLES) if (G.unlocked[k] && GEN.ORGANELLES[k].era === e && GEN.ORGANELLES[k].dna > 0) n++;
+    for (k in PERKS) if (G.perks[k] && PERKS[k].era === e) n++;
+    return n;
+  }
+  function reachedEra(G) {  // era reached when >=2 purchases in the previous era
+    var r = 1;
+    for (var e = 2; e <= 4; e++) { if (eraCount(G, e - 1) >= 2) r = e; else break; }
+    return r;
+  }
+  function nodeHTML(id, name, cost, desc, owned, open, G, color) {
+    var can = open && !owned && G.dna >= cost;
+    return '<button class="node ' + (owned ? 'own' : (can ? 'buy' : 'lok')) + '" data-id="' + id +
+      '" style="border-left:3px solid ' + color + '"><span>' + name + '</span>' +
+      '<span class="nc">' + (owned ? '&#10003; owned' : cost + ' DNA') + '</span>' +
+      '<span class="nd">' + desc + '</span></button>';
+  }
+  function renderTree(G) {
+    E.tdna.textContent = Math.floor(G.dna) + ' DNA';
+    var rc = reachedEra(G), html = '', e, i, id;
+    for (e = 1; e <= 4; e++) {
+      var open = e <= rc;
+      html += '<div class="col' + (open ? '' : ' shut') + '" style="border-top:2px solid ' + ACC[e - 1] +
+        '"><div class="ch" style="color:' + ACC[e - 1] + '">' + ERAS[e - 1] + '</div>';
+      if (!open) html += '<div class="req">unlock: 2 purchases in the previous era</div>';
+      for (i = 0; i < ORDER.length; i++) {
+        id = ORDER[i];
+        var o = GEN.ORGANELLES[id];
+        if (o.era === e) html += nodeHTML(id, o.name, o.dna, o.desc, !!G.unlocked[id], open, G, o.color);
+      }
+      for (id in PERKS) if (PERKS[id].era === e)
+        html += nodeHTML(id, PERKS[id].name, PERKS[id].dna, PERKS[id].desc, !!G.perks[id], open, G, '#8b93a5');
+      html += '</div>';
+    }
+    E.cols.innerHTML = html;
+  }
+
+  // ---------- dead / win ----------
+  function statsHTML(G) {
+    var s = G.stats;
+    var rows = [['Motes eaten', s.motes], ['Cells consumed', s.cellsEaten], ['Waves survived', s.waves],
+      ['Divisions', s.divisions], ['Peak biomass', Math.round(s.peakMass)], ['DNA earned', Math.floor(s.dnaEarned)],
+      ['Time alive', fmtT(s.timeAlive)], ['Deaths', s.deaths]];
+    var h = '';
+    for (var i = 0; i < rows.length; i++)
+      h += '<div class="sr"><span>' + rows[i][0] + '</span><span>' + rows[i][1] + '</span></div>';
+    return h;
+  }
+
+  // ---------- exports ----------
+  function init(G, r) {
+    Gref = G; root = r;
+    if (!document.getElementById('skui-css')) {
+      var st = document.createElement('style');
+      st.id = 'skui-css'; st.textContent = CSS;
+      document.head.appendChild(st);
+    }
+    root.classList.add('skui');
+    buildTitle(); buildMutate(); buildTree(); buildEnd(); buildHud();
+    show(G, G.screen || 'title');
+  }
+  function show(G, name) {
+    Gref = G; cur = name;
+    var scr = { title: E.title, mutate: E.mut, tree: E.tree, dead: E.dead, win: E.win };
+    for (var k in scr) scr[k].style.display = (k === name) ? 'flex' : 'none';
+    E.hud.style.display = (name === 'play') ? 'block' : 'none';
+    if (name === 'mutate') {
+      editG = G.player.genome.slice();      // starts as a copy of the player's
+      E.pal.style.display = 'none';
+      refreshMut();
+      if (!raf) raf = requestAnimationFrame(pvLoop);
+    } else if (name === 'tree') renderTree(G);
+    else if (name === 'dead') E.dtab.innerHTML = statsHTML(G);
+    else if (name === 'win') E.wtab.innerHTML = statsHTML(G);
+  }
+  function hud(G) {
+    Gref = G;
+    if (!E.hud) return;
+    var p = G.player; if (!p) return; var st = GEN.computeStats(p.genome);
+    root.style.setProperty('--acc', ACC[Math.max(0, Math.min(3, (G.era || 1) - 1))]);
+    var rdy = !!G.divideReady;
+    E.bio.w.classList.toggle('rdy', rdy);
+    E.bio.fill.style.width = Math.min(100, 100 * p.biomass / st.cap) + '%';
+    E.bio.lab.textContent = rdy ? 'DIVIDE READY — press E'
+                                : 'BIOMASS ' + Math.floor(p.biomass) + ' / ' + Math.round(st.cap);
+    E.nrg.fill.style.width = Math.max(0, Math.min(100, p.energy)) + '%';
+    var mhp = (20 + st.armor * 6) * (G.perks.visc ? 1.25 : 1);
+    E.hp.fill.style.width = Math.max(0, Math.min(100, 100 * p.hp / mhp)) + '%';
+    E.hdna.textContent = Math.floor(G.dna) + ' DNA';
+    E.hera.textContent = ERAS[Math.max(0, Math.min(3, (G.era || 1) - 1))];
+    var buds = G.colonyBuds ? G.colonyBuds.length : 0;
+    for (var i = 0; i < 4; i++) E.pips.children[i].classList.toggle('on', i < buds);
+    if (G.wave.active) { E.wave.className = 'wave on'; E.wave.textContent = 'PHAGE WAVE'; }
+    else {
+      var cd = G.wave.next - G.time;
+      if (cd <= 10) { E.wave.className = 'wave soon'; E.wave.textContent = 'phage wave in ' + Math.max(0, Math.ceil(cd)) + 's'; }
+      else { E.wave.className = 'wave'; E.wave.textContent = ''; }
+    }
+    var hints = [];
+    if (rdy) hints.push('E — divide');
+    hints.push('T — evolution tree');
+    if (st.shot > 0) hints.push('hold click — fire');
+    E.hint.textContent = hints.join('   ·   ');
+  }
+
+  return { init: init, show: show, hud: hud };
+})();
+
+/* SPECK — main.js: boot, loop, input, hooks, meta-progression, audio. */
+(function () {
+  'use strict';
+  var GEN = window.SPECK.genome, MODS = window.SPECK.modules;
+
+  function mulberry32(a) { return function () { a |= 0; a = a + 0x6D2B79F5 | 0; var t = Math.imul(a ^ a >>> 15, 1 | a); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+  var qs = /[?&]seed=(\d+)/.exec(location.search || '');
+  var seed = qs ? +qs[1] : ((Date.now() ^ (Math.random() * 0xffffffff)) >>> 0);
+
+  var canvas = document.getElementById('game');
+  var ctx = canvas.getContext('2d');
+  var W = 0, H = 0, DPR = 1;
+  function fit() {
+    DPR = Math.min(window.devicePixelRatio || 1, 1.5);
+    W = canvas.width = Math.round(innerWidth * DPR);
+    H = canvas.height = Math.round(innerHeight * DPR);
+  }
+  addEventListener('resize', fit); fit();
+
+  /* ---------- audio: a tiny synth ---------- */
+  var AC = null, master = null;
+  function audioInit() {
+    if (AC) return;
+    try {
+      AC = new (window.AudioContext || window.webkitAudioContext)();
+      master = AC.createGain(); master.gain.value = 0.12; master.connect(AC.destination);
+    } catch (e) { AC = null; }
+  }
+  function tone(f0, f1, dur, type, vol, when) {
+    if (!AC || G.muted) return;
+    var t0 = AC.currentTime + (when || 0);
+    var o = AC.createOscillator(), g = AC.createGain();
+    o.type = type || 'sine';
+    o.frequency.setValueAtTime(f0, t0);
+    o.frequency.exponentialRampToValueAtTime(Math.max(20, f1), t0 + dur);
+    g.gain.setValueAtTime(vol || 0.5, t0);
+    g.gain.exponentialRampToValueAtTime(0.001, t0 + dur);
+    o.connect(g); g.connect(master);
+    o.start(t0); o.stop(t0 + dur + 0.02);
+  }
+  var SFX = {
+    eat:    function () { tone(520 + G.rng() * 220, 900, 0.08, 'sine', 0.25); },
+    bite:   function () { tone(180, 90, 0.1, 'square', 0.2); },
+    hit:    function () { tone(140, 60, 0.14, 'square', 0.35); },
+    shoot:  function () { tone(880, 240, 0.09, 'sawtooth', 0.18); },
+    divide: function () { tone(300, 600, 0.22, 'sine', 0.4); tone(450, 900, 0.3, 'sine', 0.3, 0.1); },
+    ready:  function () { tone(660, 660, 0.12, 'sine', 0.3); tone(880, 880, 0.14, 'sine', 0.3, 0.13); },
+    unlock: function () { [523, 659, 784].forEach(function (f, i) { tone(f, f, 0.18, 'triangle', 0.3, i * 0.07); }); },
+    wave:   function () { tone(110, 70, 0.5, 'sawtooth', 0.4); tone(110, 70, 0.5, 'sawtooth', 0.35, 0.55); },
+    clear:  function () { [392, 523, 659, 784].forEach(function (f, i) { tone(f, f, 0.2, 'sine', 0.3, i * 0.08); }); },
+    bond:   function () { tone(700, 1200, 0.3, 'triangle', 0.35); },
+    death:  function () { [400, 300, 200, 120].forEach(function (f, i) { tone(f, f * 0.8, 0.25, 'sine', 0.35, i * 0.14); }); },
+    win:    function () { [523, 659, 784, 1046, 1318].forEach(function (f, i) { tone(f, f, 0.35, 'triangle', 0.32, i * 0.12); }); }
+  };
+
+  /* ---------- state ---------- */
+  var G = {
+    seed: seed, rng: mulberry32(seed), tick: 0, time: 0,
+    screen: 'title', paused: false, muted: false,
+    dna: 0, era: 1,
+    unlocked: { fla: true }, perks: {},
+    world: { R: 2600, light: 1, motes: [] },
+    player: null, cells: [], shots: [], viruses: [], fx: [],
+    wave: { n: 0, next: 75, active: false, left: 0 },
+    colonyBuds: [], cam: { x: 0, y: 0, zoom: 1 },
+    input: { aimX: 0, aimY: 0, thrust: 0, fire: false },
+    divideReady: false, endless: false,
+    stats: { motes: 0, cellsEaten: 0, waves: 0, divisions: 0, deaths: 0, peakMass: 0, dnaEarned: 0, timeAlive: 0 },
+    hooks: {}
+  };
+
+  /* ---------- persistence (meta-progression) ---------- */
+  function save() {
+    try { localStorage.setItem('speck-save', JSON.stringify({ unlocked: G.unlocked, perks: G.perks, muted: G.muted })); } catch (e) {}
+  }
+  (function load() {
+    try {
+      var d = JSON.parse(localStorage.getItem('speck-save') || 'null');
+      if (d && d.unlocked) { G.unlocked = d.unlocked; G.perks = d.perks || {}; G.muted = !!d.muted; G.unlocked.fla = true; }
+    } catch (e) {}
+  })();
+
+  /* ---------- era logic ---------- */
+  var PERKS = { enz: { era: 1, dna: 8 }, buoy: { era: 2, dna: 10 }, visc: { era: 3, dna: 16 }, regen: { era: 4, dna: 20 }, potent: { era: 4, dna: 22 } };
+  function eraOf(id) { return GEN.ORGANELLES[id] ? GEN.ORGANELLES[id].era : PERKS[id].era; }
+  function recomputeEra() {
+    var count = { 1: 0, 2: 0, 3: 0, 4: 0 }, id;
+    for (id in G.unlocked) if (id !== 'fla' && G.unlocked[id]) count[eraOf(id)]++;
+    for (id in G.perks) if (G.perks[id]) count[eraOf(id)]++;
+    var era = 1;
+    for (var e = 1; e < 4; e++) { if (count[e] >= 2) era = e + 1; else break; }
+    G.era = era;
+  }
+  recomputeEra();
+
+  /* ---------- hooks ---------- */
+  G.hooks.fx = function (type, x, y, opts) {
+    if (G.fx.length >= 120) G.fx.shift();
+    var f = { type: type, x: x, y: y, t0: G.time };
+    if (opts) for (var k in opts) f[k] = opts[k];
+    G.fx.push(f);
+  };
+  G.hooks.sfx = function (name) { if (SFX[name]) SFX[name](); };
+  G.hooks.divideReady = function () { SFX.ready(); };
+  G.hooks.playerDeath = function () {
+    if (G.screen !== 'play') return;
+    G.stats.deaths++; G.colonyBuds.length = 0;
+    SFX.death();
+    G.screen = 'dead'; MODS.ui.show(G, 'dead');
+  };
+  G.hooks.win = function () {
+    if (G.endless || G.screen === 'win') return;
+    SFX.win();
+    G.screen = 'win'; MODS.ui.show(G, 'win');
+  };
+  function ensurePlayer() {
+    if (G.player) return;
+    var g = GEN.emptyGenome(); g[13] = 'fla';
+    var st = GEN.computeStats(g);
+    G.player = { id: 0, species: 0, hue: 190, x: 0, y: 0, vx: 0, vy: 0, angle: 0,
+                 biomass: 26, hp: 20 + st.armor * 6, energy: 80, genome: g, gen: 0,
+                 age: 0, dead: false, cool: { fire: 0, bite: 0 }, flash: 0 };
+  }
+  G.hooks.uiStart = function () {
+    audioInit();
+    ensurePlayer();               // sims that expect main to own the player
+    MODS.sim.init(G);             // sims that build their own may replace it
+    // reconcile: exactly one player cell, and it is G.player
+    for (var i = G.cells.length - 1; i >= 0; i--)
+      if (G.cells[i].species === 0 && G.cells[i] !== G.player) G.cells.splice(i, 1);
+    if (G.cells.indexOf(G.player) < 0) G.cells.push(G.player);
+    G.screen = 'play'; MODS.ui.show(G, 'play');
+  };
+  G.hooks.uiDivide = function (genome) {
+    var p = G.player;
+    if (!p || !genome || genome.length !== 19) return;
+    for (var i = 1; i < 19; i++) if (genome[i] && !G.unlocked[genome[i]]) genome[i] = null;
+    p.genome = genome;
+    p.biomass = Math.max(20, p.biomass * 0.5);
+    p.hp = 20 + GEN.computeStats(genome).armor * 6;
+    G.dna += 8; G.stats.dnaEarned += 8; G.stats.divisions++;
+    G.divideReady = false;
+    SFX.divide();
+    G.hooks.fx('burst', p.x, p.y, { hue: p.hue });
+    var st = GEN.computeStats(genome);
+    if (st.adhesin > 0 && G.colonyBuds.length < 4) {
+      G.colonyBuds.push({ angle: G.rng() * 6.28, phase: G.rng() * 6.28 });
+      SFX.bond();
+      G.hooks.fx('bond', p.x, p.y, {});
+      if (G.colonyBuds.length >= 4) { G.hooks.win(); return; }
+    }
+    G.screen = 'play'; MODS.ui.show(G, 'play');
+  };
+  G.hooks.uiBuy = function (id) {
+    var cost = GEN.ORGANELLES[id] ? GEN.ORGANELLES[id].dna : (PERKS[id] ? PERKS[id].dna : 1e9);
+    var already = G.unlocked[id] || G.perks[id];
+    if (already || G.dna < cost || eraOf(id) > G.era) return;
+    G.dna -= cost;
+    if (GEN.ORGANELLES[id]) G.unlocked[id] = true; else G.perks[id] = true;
+    recomputeEra(); save(); SFX.unlock();
+    MODS.ui.hud(G);
+  };
+  G.hooks.uiRespawn = function () {
+    var p = G.player;
+    var a = G.rng() * 6.28, d = G.world.R * 0.55;
+    p.x = Math.cos(a) * d; p.y = Math.sin(a) * d;
+    p.vx = p.vy = 0; p.dead = false;
+    p.biomass = Math.max(26, p.biomass * 0.4);
+    p.energy = 80; p.hp = 20 + GEN.computeStats(p.genome).armor * 6;
+    if (G.cells.indexOf(p) < 0) G.cells.push(p);
+    G.divideReady = false;
+    G.screen = 'play'; MODS.ui.show(G, 'play');
+  };
+  G.hooks.uiContinue = function () { G.endless = true; G.screen = 'play'; MODS.ui.show(G, 'play'); };
+
+  /* ---------- input ---------- */
+  var keys = {};
+  var mouse = { x: 0, y: 0, down: false };
+  canvas.addEventListener('pointermove', function (e) { mouse.x = e.clientX; mouse.y = e.clientY; });
+  canvas.addEventListener('pointerdown', function (e) { audioInit(); mouse.down = true; mouse.x = e.clientX; mouse.y = e.clientY; });
+  addEventListener('pointerup', function () { mouse.down = false; });
+  addEventListener('keydown', function (e) {
+    if (e.repeat) return;
+    keys[e.key.toLowerCase()] = true;
+    var k = e.key.toLowerCase();
+    if (G.screen === 'play') {
+      if (k === 'e' && G.divideReady) { G.screen = 'mutate'; MODS.ui.show(G, 'mutate'); }
+      else if (k === 't') { G.screen = 'tree'; MODS.ui.show(G, 'tree'); }
+      else if (k === 'p') { G.paused = !G.paused; }
+    } else if (k === 'escape' || (k === 't' && G.screen === 'tree')) {
+      if (G.screen === 'tree' || G.screen === 'mutate') { G.screen = 'play'; MODS.ui.show(G, 'play'); }
+    }
+    if (k === 'm') { G.muted = !G.muted; save(); }
+  });
+  addEventListener('keyup', function (e) { keys[e.key.toLowerCase()] = false; });
+  document.addEventListener('visibilitychange', function () { if (document.hidden) G.paused = true; });
+
+  function readInput() {
+    var p = G.player;
+    if (!p) return;
+    var cx = W / 2, cy = H / 2, z = G.cam.zoom || 1;
+    var wx = G.cam.x + (mouse.x * DPR - cx) / z;
+    var wy = G.cam.y + (mouse.y * DPR - cy) / z;
+    var kx = (keys.d || keys.arrowright ? 1 : 0) - (keys.a || keys.arrowleft ? 1 : 0);
+    var ky = (keys.s || keys.arrowdown ? 1 : 0) - (keys.w || keys.arrowup ? 1 : 0);
+    if (kx || ky) {
+      G.input.aimX = p.x + kx * 240; G.input.aimY = p.y + ky * 240;
+      G.input.thrust = 1;
+    } else {
+      G.input.aimX = wx; G.input.aimY = wy;
+      var d = Math.hypot(wx - p.x, wy - p.y);
+      G.input.thrust = Math.min(1, d / (GEN.radiusOf(p.biomass) * 2.5));
+    }
+    G.input.fire = mouse.down || !!keys[' '];
+  }
+
+  /* ---------- loop ---------- */
+  var last = performance.now(), acc = 0, DT = 1 / 60, hudT = 0;
+  function frame(now) {
+    requestAnimationFrame(frame);
+    var el = Math.min(0.12, (now - last) / 1000);
+    last = now;
+    if (G.screen === 'play' && !G.paused) {
+      acc += el;
+      var steps = 0;
+      while (acc >= DT && steps < 5) {
+        readInput();
+        MODS.sim.update(G, DT);
+        MODS.combat.update(G, DT);
+        for (var i = 0; i < G.cells.length; i++) {
+          var c = G.cells[i];
+          if (c.flash > 0) c.flash = Math.max(0, c.flash - 3 * DT);
+        }
+        G.time += DT; G.tick++; G.stats.timeAlive += DT;
+        if (G.player) G.stats.peakMass = Math.max(G.stats.peakMass, G.player.biomass);
+        acc -= DT; steps++;
+      }
+      if (steps === 5) acc = 0;
+    }
+    MODS.render.draw(G, ctx, W, H, el);
+    hudT += el;
+    if (hudT > 0.1) { hudT = 0; MODS.ui.hud(G); }
+  }
+
+  /* ---------- boot ---------- */
+  MODS.ui.init(G, document.getElementById('ui'));
+  MODS.ui.show(G, 'title');
+  requestAnimationFrame(frame);
+})();
