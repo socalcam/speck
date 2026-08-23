@@ -1545,6 +1545,139 @@ window.SPECK.modules.ui = (function () {
     win:    function () { [523, 659, 784, 1046, 1318].forEach(function (f, i) { tone(f, f, 0.35, 'triangle', 0.32, i * 0.12); }); }
   };
 
+  /* ---------- gamepad: twin-stick + spatial menu nav ---------- */
+  var pad = { on: false, t: -9, last: [], navT: 0, stick: { lx: 0, ly: 0, rx: 0, ry: 0, rt: false } };
+  var lastDir = { x: 1, y: 0 };
+  function getPad() {
+    try {
+      var l = navigator.getGamepads ? navigator.getGamepads() : [];
+      for (var i = 0; i < l.length; i++) if (l[i] && l[i].connected !== false) return l[i];
+    } catch (e) {}
+    return null;
+  }
+  function dz(v) { return Math.abs(v) > 0.18 ? v : 0; }
+  function padVibe(ms, mag) {
+    if (!pad.on || G.muted) return;
+    try {
+      var gp = getPad();
+      if (gp && gp.vibrationActuator && gp.vibrationActuator.playEffect)
+        gp.vibrationActuator.playEffect('dual-rumble',
+          { duration: ms, strongMagnitude: mag, weakMagnitude: mag * 0.6 });
+    } catch (e) {}
+  }
+  /* focus ring for menus */
+  var focusCur = null;
+  (function () {
+    var st = document.createElement('style');
+    st.textContent = '.pad-focus{outline:2px solid #7dcfff !important;outline-offset:2px;' +
+      'box-shadow:0 0 14px rgba(125,207,255,.55) !important;border-radius:6px}' +
+      '#pad-toast{position:fixed;right:16px;bottom:16px;background:#12151f;color:#d5d9e0;' +
+      'border:1px solid #2a3247;border-radius:10px;padding:10px 16px;font:13px system-ui,sans-serif;' +
+      'opacity:0;transition:opacity .4s;pointer-events:none;z-index:99}';
+    document.head.appendChild(st);
+  })();
+  function visibleEl(e) {
+    // rect-based: display:none collapses to 0x0; offsetParent is unusable
+    // here because the UI screens are position:fixed.
+    if (!e || !e.getBoundingClientRect) return false;
+    var r = e.getBoundingClientRect();
+    return r.width > 2 && r.height > 2;
+  }
+  function navTargets() {
+    var root = document.getElementById('ui');
+    var all = root.querySelectorAll('button, .hx:not(.nuc)');
+    var out = [];
+    for (var i = 0; i < all.length; i++) if (visibleEl(all[i])) out.push(all[i]);
+    return out;
+  }
+  function clearFocus() {
+    if (focusCur) focusCur.classList.remove('pad-focus');
+    focusCur = null;
+  }
+  function setFocus(e) {
+    clearFocus();
+    focusCur = e;
+    e.classList.add('pad-focus');
+    try { e.scrollIntoView({ block: 'nearest' }); } catch (er) {}
+  }
+  function autoFocus() {
+    var ts = navTargets();
+    if (!ts.length) return;
+    for (var i = 0; i < ts.length; i++)
+      if (ts[i].className && /acc/.test(ts[i].className)) return setFocus(ts[i]);
+    setFocus(ts[0]);
+  }
+  function moveFocus(dx, dy) {
+    var ts = navTargets();
+    if (!ts.length) return;
+    if (!focusCur || !visibleEl(focusCur) || ts.indexOf(focusCur) < 0) { setFocus(ts[0]); return; }
+    var cr = focusCur.getBoundingClientRect();
+    var cx = cr.left + cr.width / 2, cy = cr.top + cr.height / 2;
+    var best = null, bs = 1e18;
+    for (var i = 0; i < ts.length; i++) {
+      var t = ts[i];
+      if (t === focusCur) continue;
+      var r = t.getBoundingClientRect();
+      var vx = r.left + r.width / 2 - cx, vy = r.top + r.height / 2 - cy;
+      var dot = vx * dx + vy * dy;
+      if (dot <= 4) continue;                          // must lie in that direction
+      var perp = Math.abs(vx * dy) + Math.abs(vy * dx); // off-axis penalty
+      var score = dot + perp * 2.2;
+      if (score < bs) { bs = score; best = t; }
+    }
+    if (best) setFocus(best);
+  }
+  function escLike() {
+    if (G.screen === 'tree' || G.screen === 'mutate') { G.screen = 'play'; MODS.ui.show(G, 'play'); }
+  }
+  function pollPad() {
+    var gp = getPad();
+    if (!gp) { pad.on = false; return; }
+    var b = gp.buttons || [], ax = gp.axes || [];
+    function down(i) { return !!(b[i] && b[i].pressed); }
+    function hit(i) { return down(i) && !pad.last[i]; }
+    var lx = dz(ax[0] || 0), ly = dz(ax[1] || 0), rx = dz(ax[2] || 0), ry = dz(ax[3] || 0);
+    var any = lx || ly || rx || ry;
+    for (var i = 0; i < b.length && !any; i++) if (down(i)) any = 1;
+    var now = performance.now() / 1000;
+    if (any) { pad.t = now; pad.on = true; }
+    if (pad.on) {
+      if (hit(9) && G.screen === 'play') { G.paused = !G.paused; audioInit(); }
+      if (G.screen === 'play') {
+        if (hit(3) && G.divideReady) { G.screen = 'mutate'; MODS.ui.show(G, 'mutate'); }
+        else if (hit(2)) { G.screen = 'tree'; MODS.ui.show(G, 'tree'); }
+      } else {
+        if (hit(1)) escLike();
+        if (hit(0)) {
+          audioInit();
+          var f = (focusCur && visibleEl(focusCur)) ? focusCur : null;
+          if (!f) { autoFocus(); f = focusCur; }
+          if (f) { f.click(); padVibe(30, 0.3); }
+        }
+        var nx = (hit(15) ? 1 : 0) - (hit(14) ? 1 : 0);
+        var ny = (hit(13) ? 1 : 0) - (hit(12) ? 1 : 0);
+        if (!nx && !ny && now - pad.navT > 0.22) {
+          if (Math.abs(lx) > 0.5) nx = lx > 0 ? 1 : -1;
+          else if (Math.abs(ly) > 0.5) ny = ly > 0 ? 1 : -1;
+        }
+        if (nx || ny) { moveFocus(nx, ny); pad.navT = now; }
+      }
+    }
+    pad.stick.lx = lx; pad.stick.ly = ly; pad.stick.rx = rx; pad.stick.ry = ry;
+    pad.stick.rt = down(7) || down(5);
+    pad.last.length = 0;
+    for (var j = 0; j < b.length; j++) pad.last[j] = down(j);
+  }
+  addEventListener('gamepadconnected', function () {
+    var t = document.getElementById('pad-toast');
+    if (!t) { t = document.createElement('div'); t.id = 'pad-toast'; document.body.appendChild(t); }
+    t.innerHTML = '\uD83C\uDFAE controller connected \u2014 <b>L-stick</b> swim \u00b7 <b>R-stick/RT</b> fire \u00b7 ' +
+                  '<b>Y</b> divide \u00b7 <b>X</b> tree \u00b7 <b>A</b> select \u00b7 <b>B</b> back \u00b7 <b>Start</b> pause';
+    t.style.opacity = '1';
+    setTimeout(function () { t.style.opacity = '0'; }, 5000);
+  });
+  addEventListener('gamepaddisconnected', function () { pad.on = false; });
+
   /* ---------- state ---------- */
   var G = {
     seed: seed, rng: mulberry32(seed), tick: 0, time: 0,
@@ -1592,7 +1725,13 @@ window.SPECK.modules.ui = (function () {
     if (opts) for (var k in opts) f[k] = opts[k];
     G.fx.push(f);
   };
-  G.hooks.sfx = function (name) { if (SFX[name]) SFX[name](); };
+  var VIBES = { eat: [20, 0.12], bite: [50, 0.4], hit: [70, 0.5], divide: [120, 0.4],
+                ready: [80, 0.3], wave: [300, 0.7], clear: [150, 0.4], bond: [90, 0.4],
+                death: [400, 0.8], win: [500, 0.6], die: [40, 0.2] };
+  G.hooks.sfx = function (name) {
+    if (SFX[name]) SFX[name]();
+    if (VIBES[name]) padVibe(VIBES[name][0], VIBES[name][1]);
+  };
   G.hooks.divideReady = function () { SFX.ready(); };
   G.hooks.playerDeath = function () {
     if (G.screen !== 'play') return;
@@ -1667,9 +1806,9 @@ window.SPECK.modules.ui = (function () {
 
   /* ---------- input ---------- */
   var keys = {};
-  var mouse = { x: 0, y: 0, down: false };
-  canvas.addEventListener('pointermove', function (e) { mouse.x = e.clientX; mouse.y = e.clientY; });
-  canvas.addEventListener('pointerdown', function (e) { audioInit(); mouse.down = true; mouse.x = e.clientX; mouse.y = e.clientY; });
+  var mouse = { x: 0, y: 0, down: false, t: 0 };
+  canvas.addEventListener('pointermove', function (e) { mouse.x = e.clientX; mouse.y = e.clientY; mouse.t = performance.now() / 1000; });
+  canvas.addEventListener('pointerdown', function (e) { audioInit(); mouse.down = true; mouse.x = e.clientX; mouse.y = e.clientY; mouse.t = performance.now() / 1000; });
   addEventListener('pointerup', function () { mouse.down = false; });
   addEventListener('keydown', function (e) {
     if (e.repeat) return;
@@ -1687,9 +1826,34 @@ window.SPECK.modules.ui = (function () {
   addEventListener('keyup', function (e) { keys[e.key.toLowerCase()] = false; });
   document.addEventListener('visibilitychange', function () { if (document.hidden) G.paused = true; });
 
+  var padFire = null;   // world-space fire aim when twin-sticking
   function readInput() {
     var p = G.player;
     if (!p) return;
+    padFire = null;
+    if (pad.on && pad.t > mouse.t) {
+      var st = pad.stick;
+      var mag = Math.min(1, Math.hypot(st.lx, st.ly));
+      if (mag > 0) {
+        lastDir.x = st.lx / mag; lastDir.y = st.ly / mag;
+        G.input.aimX = p.x + st.lx * 420; G.input.aimY = p.y + st.ly * 420;
+        G.input.thrust = mag;
+      } else {
+        G.input.aimX = p.x + lastDir.x * 200; G.input.aimY = p.y + lastDir.y * 200;
+        G.input.thrust = 0;
+      }
+      var rmag = Math.hypot(st.rx, st.ry);
+      if (rmag > 0.35) {
+        padFire = { x: p.x + st.rx / rmag * 420, y: p.y + st.ry / rmag * 420 };
+        G.input.fire = true;
+      } else if (st.rt) {
+        padFire = { x: p.x + lastDir.x * 420, y: p.y + lastDir.y * 420 };
+        G.input.fire = true;
+      } else {
+        G.input.fire = false;
+      }
+      return;
+    }
     var cx = W / 2, cy = H / 2, z = G.cam.zoom || 1;
     var wx = G.cam.x + (mouse.x * DPR - cx) / z;
     var wy = G.cam.y + (mouse.y * DPR - cy) / z;
@@ -1712,13 +1876,21 @@ window.SPECK.modules.ui = (function () {
     requestAnimationFrame(frame);
     var el = Math.min(0.12, (now - last) / 1000);
     last = now;
+    pollPad();
     if (G.screen === 'play' && !G.paused) {
       acc += el;
       var steps = 0;
       while (acc >= DT && steps < 5) {
         readInput();
         MODS.sim.update(G, DT);
-        MODS.combat.update(G, DT);
+        if (padFire) {                      // twin-stick: combat aims independently
+          var sax = G.input.aimX, say = G.input.aimY;
+          G.input.aimX = padFire.x; G.input.aimY = padFire.y;
+          MODS.combat.update(G, DT);
+          G.input.aimX = sax; G.input.aimY = say;
+        } else {
+          MODS.combat.update(G, DT);
+        }
         for (var i = 0; i < G.cells.length; i++) {
           var c = G.cells[i];
           if (c.flash > 0) c.flash = Math.max(0, c.flash - 3 * DT);
@@ -1736,6 +1908,15 @@ window.SPECK.modules.ui = (function () {
 
   /* ---------- boot ---------- */
   MODS.ui.init(G, document.getElementById('ui'));
+  (function () {   // pad focus follows screen changes
+    var _show = MODS.ui.show;
+    MODS.ui.show = function (g, n) {
+      var r = _show.call(MODS.ui, g, n);
+      clearFocus();
+      if (pad.on && n !== 'play') autoFocus();
+      return r;
+    };
+  })();
   MODS.ui.show(G, 'title');
   requestAnimationFrame(frame);
 })();

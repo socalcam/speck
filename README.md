@@ -16,10 +16,17 @@ Cell to Singularity (era tech tree, idle chloroplast income, persistent
 unlocks), Genome Guardian (toxin twin-stick + phage defense waves).
 
 ## Controls
-Mouse steers (distance = throttle) · WASD alternative · hold click/Space —
-fire toxin (needs a Toxin Gland) · **E** — divide & edit genome ·
-**T** — evolution tree · **P** pause · **M** mute. Tech unlocks persist in
-localStorage across visits.
+**Mouse/keyboard:** mouse steers (distance = throttle) · WASD alternative ·
+hold click/Space — fire toxin (needs a Toxin Gland) · **E** — divide & edit
+genome · **T** — evolution tree · **P** pause · **M** mute.
+
+**Controller (twin-stick):** left stick — swim · right stick — aim & fire
+independently of your heading (RT fires forward) · **Y** — divide ·
+**X** — tree · **A** — select · **B** — back · **Start** — pause. Menus are
+driven by spatial focus navigation (d-pad or stick flicks); rumble feedback
+on eat / damage / division / waves where the pad supports it. Whichever
+device you touched last has control. Tech unlocks persist in localStorage
+across visits.
 
 ## Architecture
 Zero dependencies, Canvas2D + DOM, one deterministic seeded PRNG (`?seed=N`).
