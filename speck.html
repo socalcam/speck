@@ -1549,10 +1549,18 @@ window.SPECK.modules.ui = (function () {
   var pad = { on: false, t: -9, last: [], navT: 0, stick: { lx: 0, ly: 0, rx: 0, ry: 0, rt: false } };
   var lastDir = { x: 1, y: 0 };
   function getPad() {
+    // Prefer the pad with the freshest timestamp: with Steam running the
+    // browser can list an inert virtual pad at index 0 ahead of the real one.
     try {
       var l = navigator.getGamepads ? navigator.getGamepads() : [];
-      for (var i = 0; i < l.length; i++) if (l[i] && l[i].connected !== false) return l[i];
-    } catch (e) {}
+      var best = null;
+      for (var i = 0; i < l.length; i++) {
+        var g = l[i];
+        if (!g || g.connected === false) continue;
+        if (!best || (g.timestamp || 0) > (best.timestamp || 0)) best = g;
+      }
+      return best;
+    } catch (e) { padBlocked = true; }
     return null;
   }
   function dz(v) { return Math.abs(v) > 0.18 ? v : 0; }
@@ -1630,43 +1638,181 @@ window.SPECK.modules.ui = (function () {
   function escLike() {
     if (G.screen === 'tree' || G.screen === 'mutate') { G.screen = 'play'; MODS.ui.show(G, 'play'); }
   }
+  /* Normalized pad state. Standard mapping is trusted; anything else gets
+   * baseline calibration: axes resting at ~-1 are triggers (the classic Linux
+   * evdev DualSense/DS4 layout [LX,LY,L2,RX,RY,R2,hatX,hatY]), axes resting
+   * near 0 are sticks in order LX,LY,RX,RY, and a trailing resting pair is
+   * the d-pad hat. Press L3+R3 to recalibrate. */
+  var padCal = null;
+  var padBlocked = false;
+  try {
+    if (document.featurePolicy && !document.featurePolicy.allowsFeature('gamepad'))
+      padBlocked = true;
+  } catch (e) {}
+  function readPad(gp) {
+    var b = gp.buttons || [], ax = gp.axes || [];
+    function bp(i) { return !!(b[i] && b[i].pressed); }
+    var st = { lx: 0, ly: 0, rx: 0, ry: 0, fireHold: false, a: false, bk: false,
+               face2: false, face3: false, start: false, sel: false,
+               du: false, dd: false, dl: false, dr: false, std: gp.mapping === 'standard' };
+    if (st.std) {
+      st.lx = dz(ax[0] || 0); st.ly = dz(ax[1] || 0);
+      st.rx = dz(ax[2] || 0); st.ry = dz(ax[3] || 0);
+      st.fireHold = bp(7) || bp(5);
+      st.a = bp(0); st.bk = bp(1); st.face2 = bp(2); st.face3 = bp(3);
+      st.sel = bp(8); st.start = bp(9);
+      st.du = bp(12); st.dd = bp(13); st.dl = bp(14); st.dr = bp(15);
+      return st;
+    }
+    // Non-standard: buttons never need calibration — read them FIRST so the
+    // inspector and menus work even while axes are provisional.
+    st.a = bp(0); st.bk = bp(1); st.face2 = bp(2); st.face3 = bp(3);
+    st.sel = bp(8); st.start = bp(9);
+    st.fireHold = bp(6) || bp(7) || bp(4) || bp(5);
+    if (!padCal || padCal.id !== gp.id ||
+        (bp(10) && bp(11)) || (bp(11) && bp(12)))   // L3+R3 (either raw layout)
+      padCal = { id: gp.id, locked: false, stable: 0, sig: '' };
+    if (!padCal.locked) {
+      var trig = [], sticks = [], hat = [], i, v;
+      // Fast path 1: classic Linux evdev DS4/DualSense — triggers on 2 & 5.
+      if (ax.length >= 6 && (ax[2] || 0) <= -0.55 && (ax[5] || 0) <= -0.55) {
+        sticks = [0, 1, 3, 4]; trig = [2, 5];
+        if (ax.length >= 8 && Math.abs(ax[6] || 0) < 0.4 && Math.abs(ax[7] || 0) < 0.4)
+          hat = [6, 7];
+        padCal.stable += 3;                 // fast lock: known signature
+        padCal.sig = 'evdev-ds';
+      } else if (ax.length === 4) {
+        sticks = [0, 1, 2, 3];              // Fast path 2: plain 4-axis pad
+        padCal.stable += 3;
+        padCal.sig = '4ax';
+      } else {
+        // Heuristic over the FIRST 8 axes only — motion-sensor axes beyond
+        // that (DualSense gyro/accel in some browsers) are ignored entirely,
+        // and unclassifiable axes no longer block the lock.
+        var lim = Math.min(8, ax.length);
+        for (i = 0; i < lim; i++) {
+          v = ax[i] || 0;
+          if (v <= -0.55) trig.push(i);
+          else if (Math.abs(v) < 0.4) sticks.push(i);
+        }
+        if (sticks.length >= 6 && trig.length) hat = sticks.splice(sticks.length - 2, 2);
+        if (sticks.length >= 4) {
+          var sig = trig.join() + '|' + sticks.join() + '|' + hat.join();
+          if (sig === padCal.sig) padCal.stable++;
+          else { padCal.sig = sig; padCal.stable = 1; }
+        } else { padCal.sig = ''; padCal.stable = 0; }
+      }
+      if (padCal.stable >= 5) {
+        padCal.locked = true;
+        padCal.trig = trig; padCal.sticks = sticks; padCal.hat = hat;
+        padCal.base = ax.slice();
+      }
+      if (!padCal.locked) return st;        // buttons live, sticks pending
+    }
+    var sk = padCal.sticks;
+    st.lx = dz(ax[sk[0]] || 0); st.ly = dz(ax[sk[1]] || 0);
+    st.rx = dz(ax[sk[2]] || 0); st.ry = dz(ax[sk[3]] || 0);
+    for (var t = 0; t < padCal.trig.length; t++)
+      if (ax[padCal.trig[t]] > padCal.base[padCal.trig[t]] + 0.5) st.fireHold = true;  // NaN-safe: comparison is false
+    if (padCal.hat.length === 2) {
+      var hx = ax[padCal.hat[0]] || 0, hy = ax[padCal.hat[1]] || 0;
+      st.dl = hx < -0.5; st.dr = hx > 0.5; st.du = hy < -0.5; st.dd = hy > 0.5;
+    }
+    return st;
+  }
+  var lastN = {};
+  var padDebug = false;
+  function padDebugEl() {
+    var d = document.getElementById('pad-debug');
+    if (!d) {
+      d = document.createElement('div'); d.id = 'pad-debug';
+      d.style.cssText = 'position:fixed;left:14px;bottom:14px;z-index:99;background:#12151fee;' +
+        'color:#d5d9e0;border:1px solid #2a3247;border-radius:10px;padding:10px 14px;' +
+        'font:12px ui-monospace,monospace;white-space:pre;pointer-events:none;max-width:70vw;overflow:hidden';
+      document.body.appendChild(d);
+    }
+    return d;
+  }
+  function padDebugDraw(gp, st) {
+    var d = padDebugEl();
+    if (!padDebug) { d.style.display = 'none'; return; }
+    if (!gp) {
+      d.style.display = 'block';
+      d.textContent = padBlocked
+        ? 'GAMEPAD BLOCKED: the embedding frame does not grant the gamepad\n' +
+          'permission (iframe permissions-policy). To play with a controller,\n' +
+          'open the game as a top-level page (e.g. serve speck.html locally).'
+        : 'no gamepad detected \u2014 press any button on the controller\n' +
+          '(browsers only expose a pad after a button press)';
+      return;
+    }
+    d.style.display = 'block';
+    var ln = ['PAD  ' + (gp.id || '?').slice(0, 60),
+              'mapping: "' + gp.mapping + '"' + (st.std ? ' (trusted)' : '  [calibrated remap]')];
+    var axs = '';
+    for (var i = 0; i < (gp.axes || []).length; i++) {
+      var role = '';
+      if (!st.std && padCal && padCal.locked) {
+        if (padCal.sticks.indexOf(i) >= 0) role = 'S' + padCal.sticks.indexOf(i);
+        else if (padCal.trig.indexOf(i) >= 0) role = 'T';
+        else if (padCal.hat.indexOf(i) >= 0) role = 'H';
+      }
+      axs += i + role + ':' + (gp.axes[i] >= 0 ? '+' : '') + gp.axes[i].toFixed(2) + '  ';
+    }
+    ln.push('axes  ' + axs);
+    var bs = '';
+    for (var j = 0; j < (gp.buttons || []).length; j++)
+      if (gp.buttons[j] && gp.buttons[j].pressed) bs += j + ' ';
+    ln.push('btns  ' + (bs || '-'));
+    ln.push('norm  L(' + st.lx.toFixed(2) + ',' + st.ly.toFixed(2) + ') R(' + st.rx.toFixed(2) +
+            ',' + st.ry.toFixed(2) + ') fire:' + (st.fireHold ? 1 : 0) +
+            ' dpad:' + (st.du ? 'U' : '') + (st.dd ? 'D' : '') + (st.dl ? 'L' : '') + (st.dr ? 'R' : ''));
+    d.textContent = ln.join('\n');
+  }
   function pollPad() {
     var gp = getPad();
-    if (!gp) { pad.on = false; return; }
-    var b = gp.buttons || [], ax = gp.axes || [];
-    function down(i) { return !!(b[i] && b[i].pressed); }
-    function hit(i) { return down(i) && !pad.last[i]; }
-    var lx = dz(ax[0] || 0), ly = dz(ax[1] || 0), rx = dz(ax[2] || 0), ry = dz(ax[3] || 0);
-    var any = lx || ly || rx || ry;
-    for (var i = 0; i < b.length && !any; i++) if (down(i)) any = 1;
+    if (!gp) { pad.on = false; padDebugDraw(null, null); return; }
+    var st = readPad(gp);
+    function hit(k) { return st[k] && !lastN[k]; }
+    var any = st.lx || st.ly || st.rx || st.ry || st.fireHold ||
+              st.a || st.bk || st.face2 || st.face3 || st.start || st.sel ||
+              st.du || st.dd || st.dl || st.dr;
     var now = performance.now() / 1000;
     if (any) { pad.t = now; pad.on = true; }
+    if (hit('sel')) { padDebug = !padDebug; }
+    padDebugDraw(gp, st);
     if (pad.on) {
-      if (hit(9) && G.screen === 'play') { G.paused = !G.paused; audioInit(); }
+      if (hit('start') && G.screen === 'play') { G.paused = !G.paused; audioInit(); }
       if (G.screen === 'play') {
-        if (hit(3) && G.divideReady) { G.screen = 'mutate'; MODS.ui.show(G, 'mutate'); }
-        else if (hit(2)) { G.screen = 'tree'; MODS.ui.show(G, 'tree'); }
+        // standard: Y=divide, X=tree. Remapped pads: either upper face button
+        // is contextual — divide when ready, tree otherwise.
+        var wantDivide = st.std ? hit('face3') : (hit('face2') || hit('face3'));
+        var wantTree = st.std ? hit('face2') : false;
+        if (wantDivide && G.divideReady) { G.screen = 'mutate'; MODS.ui.show(G, 'mutate'); }
+        else if (wantTree || (!st.std && (hit('face2') || hit('face3')) && !G.divideReady)) {
+          G.screen = 'tree'; MODS.ui.show(G, 'tree');
+        }
       } else {
-        if (hit(1)) escLike();
-        if (hit(0)) {
+        if (hit('bk')) escLike();
+        if (hit('a')) {
           audioInit();
           var f = (focusCur && visibleEl(focusCur)) ? focusCur : null;
           if (!f) { autoFocus(); f = focusCur; }
           if (f) { f.click(); padVibe(30, 0.3); }
         }
-        var nx = (hit(15) ? 1 : 0) - (hit(14) ? 1 : 0);
-        var ny = (hit(13) ? 1 : 0) - (hit(12) ? 1 : 0);
+        var nx = (hit('dr') ? 1 : 0) - (hit('dl') ? 1 : 0);
+        var ny = (hit('dd') ? 1 : 0) - (hit('du') ? 1 : 0);
         if (!nx && !ny && now - pad.navT > 0.22) {
-          if (Math.abs(lx) > 0.5) nx = lx > 0 ? 1 : -1;
-          else if (Math.abs(ly) > 0.5) ny = ly > 0 ? 1 : -1;
+          if (Math.abs(st.lx) > 0.5) nx = st.lx > 0 ? 1 : -1;
+          else if (Math.abs(st.ly) > 0.5) ny = st.ly > 0 ? 1 : -1;
         }
         if (nx || ny) { moveFocus(nx, ny); pad.navT = now; }
       }
     }
-    pad.stick.lx = lx; pad.stick.ly = ly; pad.stick.rx = rx; pad.stick.ry = ry;
-    pad.stick.rt = down(7) || down(5);
-    pad.last.length = 0;
-    for (var j = 0; j < b.length; j++) pad.last[j] = down(j);
+    pad.stick.lx = st.lx; pad.stick.ly = st.ly;
+    pad.stick.rx = st.rx; pad.stick.ry = st.ry;
+    pad.stick.rt = st.fireHold;
+    lastN = st;
   }
   addEventListener('gamepadconnected', function () {
     var t = document.getElementById('pad-toast');
@@ -1676,7 +1822,7 @@ window.SPECK.modules.ui = (function () {
     t.style.opacity = '1';
     setTimeout(function () { t.style.opacity = '0'; }, 5000);
   });
-  addEventListener('gamepaddisconnected', function () { pad.on = false; });
+  addEventListener('gamepaddisconnected', function () { pad.on = false; padCal = null; lastN = {}; });
 
   /* ---------- state ---------- */
   var G = {
@@ -1822,6 +1968,7 @@ window.SPECK.modules.ui = (function () {
       if (G.screen === 'tree' || G.screen === 'mutate') { G.screen = 'play'; MODS.ui.show(G, 'play'); }
     }
     if (k === 'm') { G.muted = !G.muted; save(); }
+    if (k === 'f9') { padDebug = !padDebug; }
   });
   addEventListener('keyup', function (e) { keys[e.key.toLowerCase()] = false; });
   document.addEventListener('visibilitychange', function () { if (document.hidden) G.paused = true; });
@@ -1831,7 +1978,10 @@ window.SPECK.modules.ui = (function () {
     var p = G.player;
     if (!p) return;
     padFire = null;
-    if (pad.on && pad.t > mouse.t) {
+    var stk = pad.stick;
+    var padActive = pad.on && (Math.abs(stk.lx) > 0 || Math.abs(stk.ly) > 0 ||
+                               Math.abs(stk.rx) > 0.3 || Math.abs(stk.ry) > 0.3 || stk.rt);
+    if (padActive || (pad.on && pad.t > mouse.t)) {
       var st = pad.stick;
       var mag = Math.min(1, Math.hypot(st.lx, st.ly));
       if (mag > 0) {

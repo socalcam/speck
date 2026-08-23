@@ -7,7 +7,7 @@ import { JSDOM } from 'jsdom';
 
 const html = fs.readFileSync('./speck.html', 'utf8');
 const dom = new JSDOM('<!doctype html><html><body>' + html + '</body></html>', {
-  runScripts: 'outside-only', pretendToBeVisual: true, url: 'https://localhost/'
+  runScripts: 'outside-only', pretendToBeVisual: true, url: 'https://localhost/?seed=424242'
 });
 const { window } = dom;
 

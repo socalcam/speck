@@ -24,8 +24,11 @@ genome · **T** — evolution tree · **P** pause · **M** mute.
 independently of your heading (RT fires forward) · **Y** — divide ·
 **X** — tree · **A** — select · **B** — back · **Start** — pause. Menus are
 driven by spatial focus navigation (d-pad or stick flicks); rumble feedback
-on eat / damage / division / waves where the pad supports it. Whichever
-device you touched last has control. Tech unlocks persist in localStorage
+on eat / damage / division / waves (Chrome; Firefox has no gamepad haptics).
+Active stick input always has control — the DualSense touchpad doubles as an
+OS mouse on Linux, so grazing it cannot steal the sticks; with everything
+idle, the last-touched device wins. Press Share/F9 for a live pad inspector;
+L3+R3 recalibrates a non-standard mapping. Tech unlocks persist in localStorage
 across visits.
 
 ## Architecture

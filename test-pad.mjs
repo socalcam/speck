@@ -1,7 +1,7 @@
 // SPECK controller test: fake Gamepad through the real loop.
 import fs from 'node:fs'; import { JSDOM } from 'jsdom';
 const html = fs.readFileSync('./speck.html','utf8');
-const dom = new JSDOM('<body>'+html+'</body>',{runScripts:'outside-only',pretendToBeVisual:true,url:'https://localhost/'});
+const dom = new JSDOM('<body>'+html+'</body>',{runScripts:'outside-only',pretendToBeVisual:true,url:'https://localhost/?seed=424242'});
 const w = dom.window;
 function makeCtx(){const g={addColorStop(){}};const s={};const i={createImageData:(a,b)=>({data:new Uint8ClampedArray(a*b*4)}),putImageData(){},fillRect(){},clearRect(){},beginPath(){},arc(){},fill(){},stroke(){},moveTo(){},lineTo(){},save(){},restore(){},translate(){},rotate(){},scale(){},setTransform(){},drawImage(){},measureText:()=>({width:9}),createRadialGradient:()=>g,createLinearGradient:()=>g,ellipse(){},rect(){},clip(){},closePath(){},fillText(){},quadraticCurveTo(){},setLineDash(){}};return new Proxy({},{get:(t,p)=>p in i?i[p]:(p in s?s[p]:()=>{}),set:(t,p,v)=>{s[p]=v;return true}});}
 w.HTMLCanvasElement.prototype.getContext=function(){return makeCtx();};
@@ -10,7 +10,7 @@ let n=0;w.performance.now=()=>n;w.AudioContext=undefined;
 Object.defineProperty(w,'innerWidth',{value:1280});Object.defineProperty(w,'innerHeight',{value:800});
 
 // fake gamepad
-const fakePad = { connected:true, axes:[0,0,0,0],
+const fakePad = { connected:true, mapping:'standard', axes:[0,0,0,0],
   buttons: Array.from({length:17},()=>({pressed:false})) };
 let padPlugged = false;
 Object.defineProperty(w.navigator,'getGamepads',{configurable:true,value:()=>padPlugged?[fakePad]:[]});
